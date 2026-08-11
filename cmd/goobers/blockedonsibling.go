@@ -96,7 +96,7 @@ func liveBlockedOnSiblingBlockers(ctx context.Context, provider remediationProvi
 
 // blockedOnSiblingStillBlocks reports whether pr's blocker-aware parking still
 // holds (#748). It is also used by post-merge unpark and pr-remediation.
-func blockedOnSiblingStillBlocks(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, pr providers.PullRequestSummary) (bool, error) {
+func blockedOnSiblingStillBlocks(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, pr providers.PullRequestSummary) (bool, error) {
 	blockers, err := recordedBlockedOnSiblingBlockers(ctx, provider, repo, pr)
 	if err != nil {
 		return false, err

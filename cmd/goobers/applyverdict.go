@@ -849,7 +849,7 @@ func verdictEscalationStillBlocks(ctx context.Context, provider providers.Provid
 
 func applyAdvisoryVerdict(
 	ctx context.Context,
-	provider *providers.GitHubProvider,
+	provider remediationProvider,
 	repo providers.RepositoryRef,
 	selectedNumber int,
 	selectedNumberStr, selectedHeadSHA, selectedBaseSHA string,
@@ -907,7 +907,7 @@ func applyAdvisoryVerdict(
 // removes its marked duplicates. Relisting after every create/update makes
 // concurrent creators observe and collapse each other's comments; duplicate
 // deletion tolerates another reconciler winning the race.
-func reconcileMergeReviewStatusComment(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, prNumber int, body string) error {
+func reconcileMergeReviewStatusComment(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, prNumber int, body string) error {
 	author, err := provider.AuthenticatedLogin(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve merge-review status author: %w", err)
@@ -923,7 +923,7 @@ func reconcileMergeReviewStatusComment(ctx context.Context, provider *providers.
 // status comment exists yet there is nothing to invalidate and this is a no-op:
 // posting "the verdict is stale" on a PR that never had a verdict would be
 // noise, not information.
-func markMergeReviewVerdictStale(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, prNumber int, reason string) error {
+func markMergeReviewVerdictStale(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, prNumber int, reason string) error {
 	author, err := provider.AuthenticatedLogin(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve authenticated login: %w", err)
@@ -947,7 +947,7 @@ func markMergeReviewVerdictStale(ctx context.Context, provider *providers.GitHub
 	return nil
 }
 
-func reconcileMergeReviewStatusCommentAs(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, prNumber int, author, body string) error {
+func reconcileMergeReviewStatusCommentAs(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, prNumber int, author, body string) error {
 	id := strconv.Itoa(prNumber)
 	comments, err := provider.ListComments(ctx, repo, id)
 	if err != nil {
@@ -1226,7 +1226,7 @@ func prefixedIssueNumbers(ids []string) []string {
 // listing failure returns not-a-duplicate rather than fabricating a close.
 // The caller must gate this to non-passing PRs, so a passing PR is never
 // closed as a duplicate.
-func duplicateOfEarlierPR(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, pr *providers.PullRequestSummary) (string, bool) {
+func duplicateOfEarlierPR(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, pr *providers.PullRequestSummary) (string, bool) {
 	mine := referencedIssueNumbers(pr.Body)
 	if len(mine) == 0 {
 		return "", false
@@ -1276,7 +1276,7 @@ func duplicateOfEarlierPR(ctx context.Context, provider *providers.GitHubProvide
 //
 // Fails closed on any provider error and on any file whose patch GitHub omits
 // (binary or over its size cutoff — byte-identity is then unverifiable).
-func supersededByIdenticalSibling(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, pr *providers.PullRequestSummary) (string, bool) {
+func supersededByIdenticalSibling(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, pr *providers.PullRequestSummary) (string, bool) {
 	mine, ok := changedDiffDigest(ctx, provider, repo, pr.Number)
 	if !ok {
 		return "", false
@@ -1313,7 +1313,7 @@ func supersededByIdenticalSibling(ctx context.Context, provider *providers.GitHu
 // (nothing to compare; mootFailReason owns that case), or ANY file's patch is
 // omitted by the provider (binary/too-large): an unverifiable file must never
 // be treated as matching, so callers fail closed on it.
-func changedDiffDigest(ctx context.Context, provider *providers.GitHubProvider, repo providers.RepositoryRef, number int) (string, bool) {
+func changedDiffDigest(ctx context.Context, provider remediationProvider, repo providers.RepositoryRef, number int) (string, bool) {
 	files, err := provider.PullRequestFiles(ctx, repo, strconv.Itoa(number))
 	if err != nil || len(files) == 0 {
 		return "", false
@@ -1388,6 +1388,12 @@ func newApplyVerdictProviderForRepo(root string, repo providers.RepositoryRef) (
 	switch repo.Provider {
 	case providers.ProviderADO:
 		return newADOProviderForStage(root, repo)
+	case providers.ProviderGitea:
+		token, err := providerToken(capability.ProviderPRWrite)
+		if err != nil {
+			return nil, err
+		}
+		return newGiteaProviderForStage(root, repo, token, providers.WithGiteaMutationRecorder(sidecarMutationRecorder{kind: "pr"}))
 	case providers.ProviderGitHub:
 		token, err := providerToken(capability.ProviderPRWrite)
 		if err != nil {
