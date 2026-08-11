@@ -118,7 +118,18 @@ func runMergePR(args []string, stdout, stderr io.Writer) int {
 		pf(stderr, "error: %v\n", err)
 		return 1
 	}
-	provider := newCachedGitHubProvider(root, token, providers.WithMutationRecorder(sidecarMutationRecorder{kind: "pr"}))
+	// Dispatch by routed repo kind. Building a GitHub provider unconditionally
+	// sent merge-pr's own reads (PollPullRequest/CompareCommits/
+	// PullRequestFiles) to api.github.com for a Gitea-routed PR, so the stage
+	// died 401 immediately AFTER apply-verdict had already published a passing
+	// verdict — the last GitHub hardcode between a green review and an actual
+	// merge. NewDispatcher takes the Provider interface, so the capability-
+	// checked landing seam below works the same on either backend.
+	provider, err := mergeStageProvider(root, repo, token)
+	if err != nil {
+		pf(stderr, "error: %v\n", err)
+		return 1
+	}
 	// dispatcher is the capability-checked seam (CONF-1 #2074) for the
 	// landing-surface calls below (CompareCommits/DetectMergePolicy/
 	// MergePullRequest/EnqueuePullRequest) — the ones that gap on ADO.
@@ -459,9 +470,8 @@ type mergeBranchCleanup struct {
 	Error      string
 }
 
-func cleanupMergedBranch(ctx context.Context, headRepository *providers.RepositoryRef, headBranch string, prProvider *providers.GitHubProvider) mergeBranchCleanup {
+func cleanupMergedBranch(ctx context.Context, headRepository *providers.RepositoryRef, headBranch string, prProvider mergeProvider) mergeBranchCleanup {
 	out := mergeBranchCleanup{HeadBranch: headBranch}
-	recorder := sidecarMutationRecorder{kind: "branch"}
 	fail := func(err error) mergeBranchCleanup {
 		out.Status = "failed"
 		out.Error = err.Error()
@@ -487,11 +497,21 @@ func cleanupMergedBranch(ctx context.Context, headRepository *providers.Reposito
 		return out
 	}
 
-	token, err := providerToken(capability.GitHubBranchDelete)
+	// Assert the capability is granted before mutating, and build the delete
+	// through a branch-scoped recorder so the journal records kind="branch",
+	// distinct from the merge that preceded it. Routed by repo kind: the old
+	// code built a GitHub provider here unconditionally, which sent the branch
+	// delete to api.github.com on a Gitea-routed repo.
+	branchToken, err := providerToken(capability.GitHubBranchDelete)
 	if err != nil {
 		return fail(err)
 	}
-	branchProvider := newGitHubProvider(token, providers.WithMutationRecorder(recorder))
+	branchProvider, err := mergeStageProviderWithRecorder(
+		providerStageRoot(""), *headRepository, branchToken, sidecarMutationRecorder{kind: "branch"},
+	)
+	if err != nil {
+		return fail(err)
+	}
 	if _, err := branchProvider.DeleteBranch(ctx, providers.DeleteBranchRequest{Repository: *headRepository, Name: headBranch}); err != nil {
 		return fail(fmt.Errorf("delete branch %q: %w", headBranch, err))
 	}

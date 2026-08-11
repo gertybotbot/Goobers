@@ -25,6 +25,7 @@ type remediationProvider interface {
 	UpdateComment(ctx context.Context, repo providers.RepositoryRef, commentID, body string) error
 	DeleteComment(ctx context.Context, repo providers.RepositoryRef, commentID string) error
 	AuthenticatedLogin(ctx context.Context) (string, error)
+	SubmitPullRequestReview(ctx context.Context, req providers.PullRequestReviewRequest) (providers.PullRequestReviewResult, error)
 	GetWorkItem(ctx context.Context, repo providers.RepositoryRef, id string) (providers.WorkItem, error)
 	UpdateWorkItem(ctx context.Context, req providers.UpdateWorkItemRequest) (providers.WorkItem, error)
 	UpdateWorkItemStatus(ctx context.Context, req providers.UpdateWorkItemStatusRequest) (providers.WorkItem, error)
