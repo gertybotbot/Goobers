@@ -2317,18 +2317,31 @@ func (r *Runner) finishTakeover(runID string, jr *journal.Run, phase journal.Run
 	if err := r.recordPinnedOutcome(runID, phase, jr); err != nil {
 		return Result{}, err
 	}
-	if err := r.prepareTerminal(runID, phase, jr); err != nil {
-		return Result{}, err
-	}
+	// PrepareTerminal is BEST EFFORT and must never prevent the run from being
+	// recorded terminal. It performs external forge cleanup (branch delete,
+	// goobers:run-aborted labeling), so it fails on any forge outage or
+	// credential fault. Returning early on that error used to skip the
+	// run.finished append entirely, which left the run reconstructing as
+	// PhaseRunning forever — and because claimHolderTerminal decides claim
+	// recovery from exactly that phase, every PR the run held stayed claimed
+	// for its full lease. Observed live on gerty/goobers-hew: a Gitea repo's
+	// abort labeling 401'd against api.github.com, and three aborted
+	// merge-review runs stranded three mergeable PRs.
+	//
+	// The preparer journals its own failure facts (branch_delete_failed /
+	// run_abort_label_failed), so the diagnostic survives; the error is
+	// returned to the caller AFTER terminalization so nothing is silently
+	// swallowed.
+	prepareErr := r.prepareTerminal(runID, phase, jr)
 	if err := jr.Append(journal.Event{Type: journal.EventRunFinished, Status: string(phase)}); err != nil {
-		return Result{}, fmt.Errorf("runner: journal run.finished: %w", err)
+		return Result{}, errors.Join(prepareErr, fmt.Errorf("runner: journal run.finished: %w", err))
 	}
 	res := Result{Phase: phase, FinalState: finalState, Steps: steps}
 	r.notifyTerminal(runID, phase, finalState)
 	if err := r.FinalizeTerminal(runID, phase); err != nil {
-		return res, err
+		return res, errors.Join(prepareErr, err)
 	}
-	return res, nil
+	return res, prepareErr
 }
 
 func (r *Runner) recordPinnedOutcome(runID string, phase journal.RunPhase, jr *journal.Run) error {

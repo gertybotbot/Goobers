@@ -51,6 +51,37 @@ var newRunAbortLabelProvider = func(source providers.TokenSource) workItemUpdate
 	return providers.NewGitHubProvider("", providers.WithTokenSource(source))
 }
 
+// newGiteaRunAbortLabelProvider is the Gitea arm of the same seam. It takes the
+// resolved forge base URL because, unlike GitHub, a self-hosted Gitea has no
+// well-known API host — sending this call to the GitHub default is precisely
+// the live 401. Token resolution stays on the per-request TokenSource seam so
+// the secret continues to flow through the run's registrar-based scrubbing
+// rather than being copied into a second unregistered string.
+var newGiteaRunAbortLabelProvider = func(baseURL string, source providers.TokenSource) workItemUpdater {
+	return providers.NewGiteaProvider(baseURL, "", providers.WithGiteaTokenSource(source))
+}
+
+// newTerminalRunAbortLabelProvider dispatches on the terminal repository's own
+// declared provider kind, mirroring mergeStageProvider's switch. ADO is not
+// reachable here: the label is a PR-write on the repo the terminal run acted
+// on, and an unsupported kind must fail loudly rather than fall through to a
+// GitHub call against a non-GitHub forge.
+func newTerminalRunAbortLabelProvider(cfg *instance.Config, source providers.TokenSource) (workItemUpdater, error) {
+	repo := terminalRepositoryRef(cfg)
+	switch repo.Provider {
+	case providers.ProviderGitea:
+		baseURL, err := terminalGiteaBaseURL(cfg)
+		if err != nil {
+			return nil, err
+		}
+		return newGiteaRunAbortLabelProvider(baseURL, source), nil
+	case providers.ProviderGitHub:
+		return newRunAbortLabelProvider(source), nil
+	default:
+		return nil, fmt.Errorf("run-abort labeling does not support repository provider %q", repo.Provider)
+	}
+}
+
 // buildTerminalRunAbortLabeler mirrors buildTerminalBranchDelete's shape: the
 // same credential/capability wiring, but github:pr:write (already used for PR
 // open/poll/close) rather than github:branch:delete, since labeling a PR is a
@@ -72,7 +103,11 @@ func buildTerminalRunAbortLabeler(cfg *instance.Config, registrar terminalSecret
 		if err != nil {
 			return providers.WorkItem{}, scrubTerminalError(registrar, err)
 		}
-		result, err := newRunAbortLabelProvider(set.For(string(capability.GitHubPRWrite))).UpdateWorkItem(ctx, req)
+		provider, err := newTerminalRunAbortLabelProvider(cfg, set.For(string(capability.GitHubPRWrite)))
+		if err != nil {
+			return providers.WorkItem{}, scrubTerminalError(registrar, err)
+		}
+		result, err := provider.UpdateWorkItem(ctx, req)
 		return result, scrubTerminalError(registrar, err)
 	}
 	return label, nil

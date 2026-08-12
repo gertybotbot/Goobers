@@ -38,7 +38,7 @@ func TestBuildBacklogCounter(t *testing.T) {
 		wf := &apiv1.Workflow{Spec: apiv1.WorkflowSpec{
 			Triggers: []apiv1.Trigger{{Type: apiv1.TriggerBacklogItem, Selector: map[string]string{"goobers": "true"}}},
 		}}
-		c, err := buildBacklogCounter(&instance.Config{}, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil)
+		c, err := buildBacklogCounter(&instance.Config{}, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil, "")
 		if err != nil {
 			t.Fatalf("buildBacklogCounter: %v", err)
 		}
@@ -55,7 +55,7 @@ func TestBuildBacklogCounter(t *testing.T) {
 		wf := &apiv1.Workflow{Spec: apiv1.WorkflowSpec{
 			Triggers: []apiv1.Trigger{{Type: apiv1.TriggerSchedule, Schedule: "@every 1h"}},
 		}}
-		c, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil)
+		c, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil, "")
 		if err != nil {
 			t.Fatalf("buildBacklogCounter: %v", err)
 		}
@@ -84,7 +84,7 @@ func TestBuildBacklogCounter(t *testing.T) {
 			t.Fatalf("NewResolver: %v", err)
 		}
 		quota := localscheduler.NewProviderQuotaState()
-		c, err := buildBacklogCounter(cfg, gaggle, wf, repoRef, resolver, &backlogTestRegistrar{}, "/instance/scheduler", quota)
+		c, err := buildBacklogCounter(cfg, gaggle, wf, repoRef, resolver, &backlogTestRegistrar{}, "/instance/scheduler", quota, "")
 		if err != nil {
 			t.Fatalf("buildBacklogCounter: %v", err)
 		}
@@ -165,7 +165,7 @@ func TestBuildBacklogCounter(t *testing.T) {
 				LabelPredicate: `labels.size() > 0`,
 			}},
 		}}
-		if _, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil); err == nil {
+		if _, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil, ""); err == nil {
 			t.Fatal("buildBacklogCounter succeeded with an unsupported predicate")
 		}
 	})
@@ -177,7 +177,7 @@ func TestBuildBacklogCounter(t *testing.T) {
 				FieldPredicate: `fields.number == 1`,
 			}},
 		}}
-		if _, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil); err == nil {
+		if _, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf, repoRef, nil, nil, "", nil, ""); err == nil {
 			t.Fatal("buildBacklogCounter succeeded with an unsupported field predicate")
 		}
 	})
