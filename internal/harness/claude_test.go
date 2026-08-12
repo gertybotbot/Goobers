@@ -68,9 +68,9 @@ func TestClaudeAdapterRunUsesHeadlessContractAndScopedEnvironment(t *testing.T) 
 			t.Errorf("command missing %q: %v", want, command)
 		}
 	}
-	promptFlag := slices.Index(command, "-p")
-	if promptFlag < 0 || promptFlag+1 >= len(command) ||
-		!strings.Contains(command[promptFlag+1], "write your result as JSON") {
+	promptSeparator := slices.Index(command, "--")
+	if promptSeparator < 0 || promptSeparator+1 != len(command)-1 ||
+		!strings.Contains(command[promptSeparator+1], "write your result as JSON") {
 		t.Fatalf("command does not carry the completion-file prompt: %v", command)
 	}
 	for _, token := range []string{"anthropic-key", "github-token"} {
@@ -254,8 +254,8 @@ func TestClaudeAdapterRecoveryPreservesTerminalResultBeyondTranscriptLimit(t *te
 	if !bytes.Contains(out.Transcript, []byte("recovered terminal output")) {
 		t.Fatalf("transcript lost recovery terminal output:\n%s", out.Transcript)
 	}
-	initialPrompt := runner.reqs[0].Command[slices.Index(runner.reqs[0].Command, "-p")+1]
-	recoveryPrompt := runner.reqs[1].Command[slices.Index(runner.reqs[1].Command, "-p")+1]
+	initialPrompt := runner.reqs[0].Command[len(runner.reqs[0].Command)-1]
+	recoveryPrompt := runner.reqs[1].Command[len(runner.reqs[1].Command)-1]
 	var orderedContent []string
 	for _, line := range bytes.Split(bytes.TrimSpace(out.Transcript), []byte("\n")) {
 		var event transcriptEvent
@@ -329,7 +329,7 @@ func TestClaudeAdapterRecoversMissingCompletionInSameSession(t *testing.T) {
 			if slices.Contains(runner.reqs[1].Command, "--session-id") {
 				t.Fatalf("recovery started a new session: %v", runner.reqs[1].Command)
 			}
-			recoveryPrompt := runner.reqs[1].Command[slices.Index(runner.reqs[1].Command, "-p")+1]
+			recoveryPrompt := runner.reqs[1].Command[len(runner.reqs[1].Command)-1]
 			if !strings.Contains(recoveryPrompt, tc.completionPath) ||
 				!strings.Contains(recoveryPrompt, "previous turn ended without writing") {
 				t.Fatalf("recovery prompt = %q", recoveryPrompt)

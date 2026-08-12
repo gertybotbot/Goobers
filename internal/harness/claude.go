@@ -143,8 +143,7 @@ func (c *ClaudeAdapter) Run(ctx context.Context, req RunRequest) (Outcome, error
 	}
 
 	baseCommand := resolveHarnessCommand(c.Command)
-	argv := append(baseCommand, "-p", prompt)
-	promptArg := len(baseCommand) + 1
+	argv := append(baseCommand, "-p")
 	extra := c.ExtraArgs
 	if extra == nil {
 		extra = defaultClaudeExtraArgs
@@ -162,6 +161,12 @@ func (c *ClaudeAdapter) Run(ctx context.Context, req RunRequest) (Outcome, error
 	}
 	sessionSelectorArg := len(argv)
 	argv = append(argv, "--session-id", sessionID)
+	// Prompts rendered from Goober instructions commonly begin with YAML
+	// frontmatter ("---"). Claude Code otherwise parses that positional prompt
+	// as an option and exits before starting the session. Keep every CLI option
+	// ahead of the end-of-options marker and put the prompt last.
+	argv = append(argv, "--", prompt)
+	promptArg := len(argv) - 1
 
 	env, err := buildCredentialEnv(ctx, credentialEnvConfig{
 		adapterName:                    c.Name(),
