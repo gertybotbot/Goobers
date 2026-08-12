@@ -34,6 +34,10 @@ func Resource(resource string) schema.GroupResource {
 
 // RegisteredKinds lists the CRD kinds defined by this package, in dependency
 // order (Manifest references Gaggles; Goobers and Workflows belong to Gaggles).
+// The trailing two are the RUNTIME kinds of the Kubernetes-native runner: a
+// GooberRun is one pinned run, a GooberRunAction one occurrence-bound human
+// intervention. There is deliberately no runtime kind per event, artifact,
+// attempt, or claim (see docs/design/kubernetes-native-runner.md).
 func RegisteredKinds() []string {
-	return []string{"Manifest", "Gaggle", "Goober", "Workflow"}
+	return []string{"Manifest", "Gaggle", "Goober", "Workflow", "GooberRun", "GooberRunAction"}
 }

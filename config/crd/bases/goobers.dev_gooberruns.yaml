@@ -1,0 +1,470 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: gooberruns.goobers.dev
+spec:
+  group: goobers.dev
+  names:
+    kind: GooberRun
+    listKind: GooberRunList
+    plural: gooberruns
+    shortNames:
+    - grun
+    singular: gooberrun
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .status.observedSeq
+      name: Seq
+      type: integer
+    - jsonPath: .spec.workflow.name
+      name: Workflow
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          GooberRun is one pinned workflow run reconciled by the Kubernetes-native
+          runner. Its spec is immutable pinned identity; its status is a rebuildable
+          projection of the canonical journal.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              GooberRunSpec is the IMMUTABLE pinned identity of one run. Kubernetes enforces
+              the immutability with a CEL transition rule so that neither an operator nor a
+              controller bug can retune a run in flight; every mutable fact about the run
+              lives in the canonical journal and is projected into status.
+            properties:
+              artifactStoreClass:
+                description: ArtifactStoreClass names the artifact-store profile attempts
+                  publish to.
+                type: string
+              gaggle:
+                description: Gaggle is the gaggle this run belongs to.
+                minLength: 1
+                type: string
+              goober:
+                description: Goober is the selected worker persona for agentic stages.
+                type: string
+              inputs:
+                description: |-
+                  Inputs are the content-digested immutable input snapshots pinned at run
+                  start. They are pointers, never inline bulk data.
+                items:
+                  description: |-
+                    ArtifactPointer references a stage output stored in the run journal. It is the
+                    ONLY way stages exchange non-scalar data. The path is journal-relative (e.g.
+                    "artifacts/<stage>/diff.patch"); the digest pins the content so a resolve is
+                    tamper-evident and cross-run comparable (§4).
+                  properties:
+                    digest:
+                      description: |-
+                        Digest is the content digest as "sha256:<64-hex>". It commits to the exact
+                        bytes at Path (after journal-side redaction/scrubbing, per §4).
+                      type: string
+                    integrity:
+                      description: Integrity records the artifact's provenance independently
+                        of its bytes.
+                      type: string
+                    mediaType:
+                      description: |-
+                        MediaType optionally categorizes the bytes (e.g. "text/x-patch",
+                        "application/json"). Advisory; the digest is authoritative.
+                      type: string
+                    path:
+                      description: |-
+                        Path is the journal-relative location of the artifact bytes. It must stay
+                        within the journal root: no leading "/", no ".." traversal.
+                      type: string
+                    size:
+                      description: Size is the byte length of the artifact, when known.
+                        Advisory.
+                      format: int64
+                      type: integer
+                  required:
+                  - digest
+                  - path
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+              journalRoot:
+                description: |-
+                  JournalRoot is the durable location of the canonical run journal. It is
+                  the authority the controller reads before every decision.
+                minLength: 1
+                type: string
+              repository:
+                description: Repository pins provider routing for every attempt and
+                  terminal seam.
+                properties:
+                  externalId:
+                    description: |-
+                      ExternalID is the backlog item / issue identifier this run claims, when
+                      the run is item-triggered. It is the claim key's external component.
+                    type: string
+                  provider:
+                    description: Provider is the provider kind ("github", "gitea",
+                      "azuredevops").
+                    minLength: 1
+                    type: string
+                  repository:
+                    description: Repository is the provider-scoped repository identifier
+                      (e.g. "org/repo").
+                    type: string
+                required:
+                - provider
+                type: object
+              runControls:
+                description: |-
+                  RunControls pins the effective inherited safety budgets this run started
+                  with, so a config reload cannot widen a live run's budget.
+                properties:
+                  maxRepasses:
+                    description: MaxRepasses bounds consecutive non-pass evaluations
+                      before escalation.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxRunDuration:
+                    description: |-
+                      MaxRunDuration is the maximum total wall-clock age of a run. Empty
+                      disables the total-duration limit. It uses Go duration syntax.
+                    minLength: 1
+                    type: string
+                  stalledRunTimeout:
+                    description: |-
+                      StalledRunTimeout is the maximum period a running journal may remain
+                      silent before the watchdog escalates it. It uses Go duration syntax.
+                    minLength: 1
+                    type: string
+                type: object
+              runId:
+                description: |-
+                  RunID is the globally unique run identifier — the OpenTelemetry trace id
+                  for the run, and the journal directory name.
+                maxLength: 128
+                minLength: 1
+                pattern: ^[A-Za-z0-9][A-Za-z0-9._-]*$
+                type: string
+              serviceAccountName:
+                description: ServiceAccountName is the per-gaggle service account
+                  attempt Jobs run as.
+                type: string
+              trigger:
+                description: Trigger is what started the run.
+                properties:
+                  kind:
+                    description: Kind is the trigger kind.
+                    enum:
+                    - manual
+                    - schedule
+                    - signal
+                    - item
+                    type: string
+                  ref:
+                    description: |-
+                      Ref is the trigger-specific reference: cron expression, signal name, or
+                      backlog item id. Empty for a bare manual run.
+                    type: string
+                required:
+                - kind
+                type: object
+              workerImage:
+                description: WorkerImage is the container image an attempt Job runs.
+                type: string
+              workflow:
+                description: Workflow is the pinned workflow identity (WF-016).
+                properties:
+                  digest:
+                    description: |-
+                      Digest is the tamper-evident content digest of the compiled definition
+                      ("sha256:<64-hex>", from workflow Machine.Digest()).
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                  dslVersion:
+                    description: DSLVersion is the workflow DSL version the definition
+                      compiled under.
+                    type: string
+                  graphRef:
+                    description: |-
+                      GraphRef points at the immutable compiled-graph input snapshot in the
+                      journal. The controller resolves the machine by digest, never by
+                      re-reading live config.
+                    properties:
+                      digest:
+                        description: |-
+                          Digest is the content digest as "sha256:<64-hex>". It commits to the exact
+                          bytes at Path (after journal-side redaction/scrubbing, per §4).
+                        type: string
+                      integrity:
+                        description: Integrity records the artifact's provenance independently
+                          of its bytes.
+                        type: string
+                      mediaType:
+                        description: |-
+                          MediaType optionally categorizes the bytes (e.g. "text/x-patch",
+                          "application/json"). Advisory; the digest is authoritative.
+                        type: string
+                      path:
+                        description: |-
+                          Path is the journal-relative location of the artifact bytes. It must stay
+                          within the journal root: no leading "/", no ".." traversal.
+                        type: string
+                      size:
+                        description: Size is the byte length of the artifact, when
+                          known. Advisory.
+                        format: int64
+                        type: integer
+                    required:
+                    - digest
+                    - path
+                    type: object
+                  name:
+                    description: Name is the workflow definition name.
+                    minLength: 1
+                    type: string
+                  version:
+                    description: Version is the registry-assigned monotonic definition
+                      version.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - digest
+                - name
+                - version
+                type: object
+            required:
+            - gaggle
+            - journalRoot
+            - runId
+            - trigger
+            - workflow
+            type: object
+            x-kubernetes-validations:
+            - message: 'GooberRun spec is immutable: pinned run identity may never
+                be retuned in flight'
+              rule: self == oldSelf
+          status:
+            description: |-
+              GooberRunStatus is a PROJECTION of the canonical journal. Every field here is
+              rebuildable: deleting the whole status and reconciling must reproduce it
+              exactly. When status and journal disagree, the journal wins.
+            properties:
+              attempts:
+                description: Attempts are the Jobs the controller has dispatched,
+                  most recent last.
+                items:
+                  description: |-
+                    AttemptRef projects one dispatched Kubernetes Job. It is evidence, not
+                    authority: the controller records what it created so that a duplicate
+                    observation is recognisable, but only a committed journal event advances the
+                    machine.
+                  properties:
+                    attempt:
+                      description: Attempt is the 1-based attempt number within the
+                        state.
+                      format: int32
+                      minimum: 1
+                      type: integer
+                    attemptClass:
+                      description: |-
+                        AttemptClass tags why a non-initial attempt exists ("policy", "infra",
+                        "human"). Empty on the initial attempt.
+                      enum:
+                      - policy
+                      - infra
+                      - human
+                      type: string
+                    branch:
+                      description: Branch is the parallel branch id (0 is the run's
+                        root branch).
+                      format: int32
+                      type: integer
+                    dispatchedSeq:
+                      description: |-
+                        DispatchedSeq is the journal sequence of the stage.started event this Job
+                        was dispatched for. It binds the Job to an exact journal occurrence.
+                      format: int64
+                      type: integer
+                    jobName:
+                      description: |-
+                        JobName is the deterministic Job name derived from run UID, state, and
+                        attempt (see kuberunner.JobName). It is stable across reconciles, which is
+                        what makes create-once safe after a crash between journal append and Job
+                        create.
+                      minLength: 1
+                      type: string
+                    state:
+                      description: State is the workflow machine state this attempt
+                        executes.
+                      minLength: 1
+                      type: string
+                  required:
+                  - attempt
+                  - jobName
+                  - state
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - jobName
+                x-kubernetes-list-type: map
+              conditions:
+                description: Conditions follow standard Kubernetes conventions.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastErrorCode:
+                description: LastErrorCode is the most recent journalled error classifier.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the .metadata.generation last reconciled.
+                format: int64
+                type: integer
+              observedSeq:
+                description: |-
+                  ObservedSeq is the highest journal sequence this projection reflects. It
+                  is the projection's watermark, never workflow progress in itself.
+
+                  It is int64 rather than the journal's own uint64 because uint64 is not a
+                  representable Kubernetes API type: the apiserver's structured-merge-diff
+                  cannot encode it, so a uint64 field panics on any status write. Sequences
+                  are small monotonic counters, so the narrowing is not lossy in practice.
+                format: int64
+                type: integer
+              pause:
+                description: |-
+                  Pause is the occurrence a waiting run is parked at. Set iff phase is
+                  Waiting.
+                properties:
+                  branch:
+                    description: Branch is the branch the pause occurred on.
+                    format: int32
+                    type: integer
+                  gate:
+                    description: Gate is the gate name the run is paused at.
+                    minLength: 1
+                    type: string
+                  seq:
+                    description: |-
+                      Seq is the journal sequence of the pausing event. It is the occurrence
+                      identity: the same gate may pause many times in one run.
+                    format: int64
+                    minimum: 1
+                    type: integer
+                required:
+                - gate
+                - seq
+                type: object
+              phase:
+                description: Phase is the coarse projected lifecycle phase.
+                enum:
+                - Pending
+                - Running
+                - Waiting
+                - Completed
+                - Failed
+                - Aborted
+                - Escalated
+                type: string
+              state:
+                description: |-
+                  State is the current machine state (or terminal target) the journal says
+                  the run occupies.
+                type: string
+              terminalStatus:
+                description: TerminalStatus is the committed run.finished status,
+                  when terminal.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -42,6 +42,12 @@ type NotificationEvidenceRef struct {
 }
 
 // NotificationRequest is exact, pre-rendered content for one or more sinks.
+//
+// Runtime wire envelope, not a Kubernetes object — excluded from controller-gen
+// DeepCopy generation for the same reason ResultEnvelope is: its bare
+// time.Time fields are not apimachinery types and have no DeepCopyInto, so
+// generating a deepcopy for it emits code that does not compile.
+// +kubebuilder:object:generate=false
 type NotificationRequest struct {
 	Schema         string                    `json:"schema"`
 	NotificationID string                    `json:"notificationId"`
@@ -78,6 +84,10 @@ type NotificationSinkRef struct {
 }
 
 // NotificationReceipt durably records one sink attempt or suppression.
+//
+// Runtime wire envelope, not a Kubernetes object — excluded from controller-gen
+// DeepCopy generation (bare time.Time fields; see NotificationRequest).
+// +kubebuilder:object:generate=false
 type NotificationReceipt struct {
 	Schema            string                     `json:"schema"`
 	NotificationID    string                     `json:"notificationId"`

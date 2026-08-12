@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"github.com/goobers/goobers/internal/kuberunner"
 )
 
 // Options configures the operator manager.
@@ -20,6 +23,20 @@ type Options struct {
 	HealthAddr string
 	// LeaderElection enables leader election for HA operator deployments.
 	LeaderElection bool
+	// RunsDir is the durable directory holding canonical run journals. Setting
+	// it activates the Kubernetes-native runner (internal/kuberunner); leaving
+	// it empty leaves the operator reconciling Gaggles only.
+	//
+	// The native runner is opt-in precisely because the journal is authoritative:
+	// a controller pointed at the wrong (or an empty) journal root would project
+	// nonsense over real runs, so it must be named explicitly rather than
+	// defaulted into existence.
+	RunsDir string
+	// ResultsDir is where attempt Jobs publish result receipts. Defaults to a
+	// "results" sibling of RunsDir.
+	ResultsDir string
+	// WorkerImage overrides the attempt container image.
+	WorkerImage string
 }
 
 // DefaultOptions returns sane defaults for running in-cluster.
@@ -69,6 +86,56 @@ func Run(ctx context.Context, logger *slog.Logger, opts Options) error {
 		return fmt.Errorf("setup gaggle reconciler: %w", err)
 	}
 
+	if err := setupKubeRunner(mgr, logger, opts); err != nil {
+		return err
+	}
+
 	logger.Info("operator manager starting")
 	return mgr.Start(ctx)
+}
+
+// setupKubeRunner wires the Kubernetes-native runner when a journal root is
+// configured.
+//
+// This deliberately does NOT touch internal/engine: the Temporal runner stays
+// quarantined, and nothing here starts a Temporal client, a task-queue worker,
+// or a Postgres connection. The native runner's only durable dependency is the
+// same plain-file journal the local runner already owns.
+func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) error {
+	if opts.RunsDir == "" {
+		logger.Info("kubernetes-native runner disabled (no runs directory configured)")
+		return nil
+	}
+
+	resultsDir := opts.ResultsDir
+	if resultsDir == "" {
+		resultsDir = filepath.Join(filepath.Dir(opts.RunsDir), "results")
+	}
+
+	store := kuberunner.NewFSJournalStore(opts.RunsDir)
+
+	runReconciler := &kuberunner.RunReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Journal:     store,
+		Results:     kuberunner.NewFSResultReader(resultsDir),
+		Machine:     kuberunner.StaticMachineResolver{},
+		WorkerImage: opts.WorkerImage,
+	}
+	if err := runReconciler.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup gooberrun reconciler: %w", err)
+	}
+
+	actionReconciler := &kuberunner.ActionReconciler{
+		Client:  mgr.GetClient(),
+		Scheme:  mgr.GetScheme(),
+		Journal: store,
+	}
+	if err := actionReconciler.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup gooberrunaction reconciler: %w", err)
+	}
+
+	logger.Info("kubernetes-native runner enabled",
+		"runsDir", opts.RunsDir, "resultsDir", resultsDir)
+	return nil
 }
