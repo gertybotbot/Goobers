@@ -2321,12 +2321,9 @@ func (r *Runner) finishTakeover(runID string, jr *journal.Run, phase journal.Run
 	// recorded terminal. It performs external forge cleanup (branch delete,
 	// goobers:run-aborted labeling), so it fails on any forge outage or
 	// credential fault. Returning early on that error used to skip the
-	// run.finished append entirely, which left the run reconstructing as
-	// PhaseRunning forever — and because claimHolderTerminal decides claim
-	// recovery from exactly that phase, every PR the run held stayed claimed
-	// for its full lease. Observed live on gerty/goobers-hew: a Gitea repo's
-	// abort labeling 401'd against api.github.com, and three aborted
-	// merge-review runs stranded three mergeable PRs.
+	// run.finished append entirely, which leaves the run reconstructing as
+	// PhaseRunning forever. Claim recovery depends on that phase, so a terminal
+	// run must be recorded before external cleanup errors are returned.
 	//
 	// The preparer journals its own failure facts (branch_delete_failed /
 	// run_abort_label_failed), so the diagnostic survives; the error is

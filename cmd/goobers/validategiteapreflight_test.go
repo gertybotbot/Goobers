@@ -63,16 +63,16 @@ func TestGitRepositoryReachableProbesGiteaForge(t *testing.T) {
 
 	repo := instance.RepoRef{
 		Provider: "gitea",
-		Owner:    "gerty",
-		Name:     "goobers-hew",
-		BaseURL:  "https://git.k3s.ca",
+		Owner:    "acme",
+		Name:     "widgets",
+		BaseURL:  "https://gitea.example.test",
 	}
 	if err := gitRepositoryReachable(context.Background(), repo, "gitea-preflight-token", nil); err != nil {
 		t.Fatalf("gitRepositoryReachable: %v", err)
 	}
 
 	log := readGitLog(t, logFile)
-	if !strings.Contains(log, "ls-remote https://git.k3s.ca/gerty/goobers-hew.git") {
+	if !strings.Contains(log, "ls-remote https://gitea.example.test/acme/widgets.git") {
 		t.Fatalf("preflight did not ls-remote the configured gitea forge; log:\n%s", log)
 	}
 	if strings.Contains(log, "github.com") {
@@ -140,7 +140,7 @@ func TestGitRepositoryReachableRequiresGiteaBaseURL(t *testing.T) {
 	testdep.Require(t, "bash")
 	installRecordingGit(t)
 
-	repo := instance.RepoRef{Provider: "gitea", Owner: "gerty", Name: "goobers-hew"}
+	repo := instance.RepoRef{Provider: "gitea", Owner: "acme", Name: "widgets"}
 	err := gitRepositoryReachable(context.Background(), repo, "tok", nil)
 	if err == nil {
 		t.Fatal("expected a missing-baseUrl error")
@@ -160,11 +160,11 @@ func TestGiteaPreflightRootURLNormalization(t *testing.T) {
 		baseURL string
 		want    string
 	}{
-		{name: "plain root", baseURL: "https://git.k3s.ca", want: "https://git.k3s.ca"},
-		{name: "trailing slash", baseURL: "https://git.k3s.ca/", want: "https://git.k3s.ca"},
-		{name: "api endpoint", baseURL: "https://git.k3s.ca/api/v1", want: "https://git.k3s.ca"},
-		{name: "api endpoint with slash", baseURL: "https://git.k3s.ca/api/v1/", want: "https://git.k3s.ca"},
-		{name: "surrounding whitespace", baseURL: "  https://git.k3s.ca  ", want: "https://git.k3s.ca"},
+		{name: "plain root", baseURL: "https://gitea.example.test", want: "https://gitea.example.test"},
+		{name: "trailing slash", baseURL: "https://gitea.example.test/", want: "https://gitea.example.test"},
+		{name: "api endpoint", baseURL: "https://gitea.example.test/api/v1", want: "https://gitea.example.test"},
+		{name: "api endpoint with slash", baseURL: "https://gitea.example.test/api/v1/", want: "https://gitea.example.test"},
+		{name: "surrounding whitespace", baseURL: "  https://gitea.example.test  ", want: "https://gitea.example.test"},
 		{name: "subpath install", baseURL: "https://example.com/gitea", want: "https://example.com/gitea"},
 	}
 	for _, tc := range tests {
@@ -193,7 +193,7 @@ func TestGitRepositoryReachableAgainstRealGiteaStyleRemote(t *testing.T) {
 	root := t.TempDir()
 	// Lay the bare repo out exactly as the preflight addresses it:
 	// <root>/<owner>/<name>.git
-	repoDir := filepath.Join(root, "gerty", "goobers-hew.git")
+	repoDir := filepath.Join(root, "acme", "widgets.git")
 	if err := os.MkdirAll(filepath.Dir(repoDir), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestGitRepositoryReachableAgainstRealGiteaStyleRemote(t *testing.T) {
 
 	t.Run("existing repo is reachable", func(t *testing.T) {
 		err := gitRepositoryReachable(context.Background(), instance.RepoRef{
-			Provider: "gitea", Owner: "gerty", Name: "goobers-hew", BaseURL: "file://" + root,
+			Provider: "gitea", Owner: "acme", Name: "widgets", BaseURL: "file://" + root,
 		}, "", nil)
 		if err != nil {
 			t.Fatalf("expected the real remote to be reachable: %v", err)
@@ -229,7 +229,7 @@ func TestGitRepositoryReachableAgainstRealGiteaStyleRemote(t *testing.T) {
 
 	t.Run("missing repo is unreachable", func(t *testing.T) {
 		err := gitRepositoryReachable(context.Background(), instance.RepoRef{
-			Provider: "gitea", Owner: "gerty", Name: "does-not-exist", BaseURL: "file://" + root,
+			Provider: "gitea", Owner: "acme", Name: "does-not-exist", BaseURL: "file://" + root,
 		}, "", nil)
 		if err == nil {
 			t.Fatal("expected a missing repo to be reported unreachable")

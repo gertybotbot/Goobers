@@ -68,10 +68,9 @@ var newRunAbortLabelProvider = func(source providers.TokenSource) workItemUpdate
 
 // newGiteaRunAbortLabelProvider is the Gitea arm of the same seam. It takes the
 // resolved forge base URL because, unlike GitHub, a self-hosted Gitea has no
-// well-known API host — sending this call to the GitHub default is precisely
-// the live 401. Token resolution stays on the per-request TokenSource seam so
-// the secret continues to flow through the run's registrar-based scrubbing
-// rather than being copied into a second unregistered string.
+// well-known API host. Token resolution stays on the per-request TokenSource
+// seam so the secret continues to flow through the run's registrar-based
+// scrubbing rather than being copied into a second unregistered string.
 var newGiteaRunAbortLabelProvider = func(baseURL string, source providers.TokenSource) workItemUpdater {
 	return providers.NewGiteaProvider(baseURL, "", providers.WithGiteaTokenSource(source))
 }

@@ -14,14 +14,9 @@ import (
 // alone — cfg.Repos[0], the same repo buildTerminalBranchDelete has always
 // used — rather than from a stage's routed RepositoryRef.
 //
-// Both entrypoints previously hard-coded providers.NewGitHubProvider. On a
-// Gitea instance that sent every terminal branch delete and every
-// goobers:run-aborted label to api.github.com with a Gitea token, which is
-// exactly the 401 observed live on gerty/goobers-hew: an aborted merge-review
-// run journaled run_abort_label_failed after calling api.github.com, leaving
-// the PR unlabeled and therefore still eligible for a later independent
-// merge-review to approve and auto-merge — the precise failure abortedRunLabel
-// exists to prevent.
+// Both entrypoints must preserve the configured provider. Dispatching terminal
+// cleanup through another provider loses branch deletion and run-abort labels,
+// breaking the terminal-state invariants those hooks enforce.
 
 // terminalRepositoryRef is the repository the terminal preparer acts on,
 // carrying the repo's OWN declared provider kind instead of an unconditional

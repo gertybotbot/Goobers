@@ -23,8 +23,8 @@ func (s staticTerminalTokenSource) Token(context.Context) (string, error) { retu
 func giteaTerminalConfig(baseURL string) *instance.Config {
 	return &instance.Config{Repos: []instance.RepoRef{{
 		Provider: "gitea",
-		Owner:    "gerty",
-		Name:     "goobers-hew",
+		Owner:    "acme",
+		Name:     "widgets",
 		BaseURL:  baseURL,
 	}}}
 }
@@ -42,7 +42,7 @@ func TestTerminalRepositoryRefCarriesConfiguredProvider(t *testing.T) {
 	}{
 		{
 			name: "gitea repo keeps gitea",
-			cfg:  giteaTerminalConfig("https://git.k3s.ca"),
+			cfg:  giteaTerminalConfig("https://gitea.example.test"),
 			want: providers.ProviderGitea,
 		},
 		{
@@ -66,9 +66,8 @@ func TestTerminalRepositoryRefCarriesConfiguredProvider(t *testing.T) {
 }
 
 // TestTerminalRunAbortLabelProviderRoutesByRepoKind is the discriminating
-// regression test for the live 401: on a Gitea repo the run-abort labeler must
-// NOT construct the GitHub provider at all. The GitHub seam is replaced with a
-// tripwire that fails the test if it is ever reached.
+// provider invariant: on a Gitea repo the run-abort labeler must not construct
+// the GitHub provider. The GitHub seam is a tripwire for incorrect dispatch.
 func TestTerminalRunAbortLabelProviderRoutesByRepoKind(t *testing.T) {
 	previousGitHub := newRunAbortLabelProvider
 	newRunAbortLabelProvider = func(providers.TokenSource) workItemUpdater {
@@ -95,7 +94,7 @@ func TestTerminalRunAbortLabelProviderRoutesByRepoKind(t *testing.T) {
 	}
 	t.Cleanup(func() { newGiteaRunAbortLabelProvider = previousGitea })
 
-	cfg := giteaTerminalConfig("https://git.k3s.ca")
+	cfg := giteaTerminalConfig("https://gitea.example.test")
 	provider, err := newTerminalRunAbortLabelProvider(cfg, staticTerminalTokenSource("gitea-pat"))
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +102,7 @@ func TestTerminalRunAbortLabelProviderRoutesByRepoKind(t *testing.T) {
 	if provider == nil {
 		t.Fatal("nil provider")
 	}
-	if gotBaseURL != "https://git.k3s.ca" {
+	if gotBaseURL != "https://gitea.example.test" {
 		t.Fatalf("baseURL = %q, want the configured gitea root", gotBaseURL)
 	}
 	if gotToken != "gitea-pat" {
@@ -226,10 +225,10 @@ func TestTerminalRunAbortLabelReachesGiteaEndpoint(t *testing.T) {
 	}
 	var sawLabelPost bool
 	for _, p := range paths {
-		if !strings.HasPrefix(p, "/api/v1/repos/gerty/goobers-hew") {
+		if !strings.HasPrefix(p, "/api/v1/repos/acme/widgets") {
 			t.Fatalf("request path %q is not the configured gitea repo route", p)
 		}
-		if p == "/api/v1/repos/gerty/goobers-hew/issues/77/labels" {
+		if p == "/api/v1/repos/acme/widgets/issues/77/labels" {
 			sawLabelPost = true
 		}
 	}
@@ -274,7 +273,7 @@ func TestTerminalBranchDeleteProviderRoutesByRepoKind(t *testing.T) {
 	}
 	t.Cleanup(func() { newGiteaTerminalBranchDeleter = previousGitea })
 
-	cfg := giteaTerminalConfig("https://git.k3s.ca")
+	cfg := giteaTerminalConfig("https://gitea.example.test")
 	deleter, err := newTerminalBranchDeleteProvider(cfg, staticTerminalTokenSource("gitea-pat"))
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +283,7 @@ func TestTerminalBranchDeleteProviderRoutesByRepoKind(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if gotBaseURL != "https://git.k3s.ca" || gotToken != "gitea-pat" {
+	if gotBaseURL != "https://gitea.example.test" || gotToken != "gitea-pat" {
 		t.Fatalf("baseURL = %q, token = %q", gotBaseURL, gotToken)
 	}
 }
@@ -328,8 +327,8 @@ func TestBuildTerminalRunAbortLabelerUsesGiteaOnGiteaInstance(t *testing.T) {
 
 	cfg := &instance.Config{Repos: []instance.RepoRef{{
 		Provider: "gitea",
-		Owner:    "gerty",
-		Name:     "goobers-hew",
+		Owner:    "acme",
+		Name:     "widgets",
 		BaseURL:  srv.URL,
 		Token:    instance.TokenRef{Env: "GITEA_PR_TOKEN"},
 	}}}

@@ -379,16 +379,9 @@ func recover(dir string, publicationLocked bool, opts ...Option) (*Run, RecoverR
 // A gate the runner EXECUTED that resolves to a reserved TERMINAL target
 // ("@abort"/"@escalate") ends the run, and does not always get a trailing
 // run.finished event: terminalization can die between the gate and the
-// run.finished append (the run's terminal preparer performs external forge
-// cleanup, so any 401/outage there used to abort finishTakeover early). Left
-// unhandled, such a run reported PhaseRunning forever, which is not a cosmetic
-// status bug — claimHolderTerminal decides claim recovery by asking whether the
-// holding run's phase is still running, so every PR claimed by an aborted run
-// stayed stranded for its full lease. Observed live on gerty/goobers-hew: 16
-// merge-review runs ended at
-// `gate.evaluated gate=merged-gate verdict=fail target=@abort` followed only by
-// a `run_abort_label_failed` 401, and their claims made mergeable PRs invisible
-// to BOTH merge-review's pr-select and pr-remediation's gather-pr-context.
+// run.finished append because the terminal preparer performs external forge
+// cleanup. Left unhandled, the run reports PhaseRunning forever and its claim
+// remains unavailable to both selection and remediation until the lease ends.
 //
 // A HUMAN gate's decision is deliberately NOT terminal here. A human decision
 // is recorded out-of-band (gate.Evaluator.EvaluateHuman appends gate.evaluated

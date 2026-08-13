@@ -28,8 +28,8 @@ func giteaCounterInstance(t *testing.T, baseURL string) (string, *instance.Confi
 	}
 	cfg := &instance.Config{Repos: []instance.RepoRef{{
 		Provider: "gitea",
-		Owner:    "gerty",
-		Name:     "goobers-hew",
+		Owner:    "acme",
+		Name:     "widgets",
 		BaseURL:  baseURL,
 		Token:    instance.TokenRef{Env: "GITEA_BACKLOG_TOK"},
 	}}}
@@ -44,7 +44,7 @@ func giteaCounterInstance(t *testing.T, baseURL string) (string, *instance.Confi
 // newCounterProvider dispatches on, so an unconditional GitHub here sent a
 // Gitea instance's backlog count to api.github.com.
 func TestBacklogCounterRepoRefCarriesConfiguredProvider(t *testing.T) {
-	repoRef := apiv1.RepoRef{Owner: "gerty", Name: "goobers-hew"}
+	repoRef := apiv1.RepoRef{Owner: "acme", Name: "widgets"}
 	tests := []struct {
 		name string
 		cfg  *instance.Config
@@ -52,7 +52,7 @@ func TestBacklogCounterRepoRefCarriesConfiguredProvider(t *testing.T) {
 	}{
 		{
 			name: "gitea instance counts against gitea",
-			cfg:  &instance.Config{Repos: []instance.RepoRef{{Provider: "gitea", Owner: "gerty", Name: "goobers-hew"}}},
+			cfg:  &instance.Config{Repos: []instance.RepoRef{{Provider: "gitea", Owner: "acme", Name: "widgets"}}},
 			want: providers.ProviderGitea,
 		},
 		{
@@ -77,9 +77,8 @@ func TestBacklogCounterRepoRefCarriesConfiguredProvider(t *testing.T) {
 
 // TestBacklogCounterCountsAgainstGitea is the end-to-end proof that a Gitea
 // instance's backlog fan-out count reaches the configured self-hosted forge
-// with the Gitea token, never api.github.com. Before the fix every tick of a
-// type=backlog-item trigger on a Gitea repo 401'd and the workflow's eligible
-// count was permanently wedged at zero.
+// with the Gitea token, never api.github.com. Routing to the wrong provider
+// prevents the scheduler from observing eligible work.
 func TestBacklogCounterCountsAgainstGitea(t *testing.T) {
 	t.Setenv("GITEA_BACKLOG_TOK", "gitea-backlog-token")
 
@@ -101,7 +100,7 @@ func TestBacklogCounterCountsAgainstGitea(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	root, cfg := giteaCounterInstance(t, srv.URL)
-	resolver, err := credentials.NewResolver([]credentials.TokenRef{{Name: "gerty/goobers-hew", Env: "GITEA_BACKLOG_TOK"}})
+	resolver, err := credentials.NewResolver([]credentials.TokenRef{{Name: "acme/widgets", Env: "GITEA_BACKLOG_TOK"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +111,7 @@ func TestBacklogCounterCountsAgainstGitea(t *testing.T) {
 		}},
 	}}
 	c, err := buildBacklogCounter(cfg, apiv1.Gaggle{}, wf,
-		apiv1.RepoRef{Owner: "gerty", Name: "goobers-hew"},
+		apiv1.RepoRef{Owner: "acme", Name: "widgets"},
 		resolver, &backlogTestRegistrar{}, filepath.Join(root, "scheduler"), nil, root)
 	if err != nil {
 		t.Fatalf("buildBacklogCounter: %v", err)
@@ -158,7 +157,7 @@ func TestBuildOpenPRRefresherRefusesNonGitHubRepo(t *testing.T) {
 
 	t.Run("gitea repo is refused", func(t *testing.T) {
 		cfg := &instance.Config{Repos: []instance.RepoRef{{
-			Provider: "gitea", Owner: "gerty", Name: "goobers-hew", BaseURL: "https://git.k3s.ca",
+			Provider: "gitea", Owner: "acme", Name: "widgets", BaseURL: "https://gitea.example.test",
 		}}}
 		_, err := buildOpenPRRefresher(cfg, cappedWorkflows, &backlogTestRegistrar{}, nil, t.TempDir(), nil)
 		if err == nil {
@@ -171,7 +170,7 @@ func TestBuildOpenPRRefresherRefusesNonGitHubRepo(t *testing.T) {
 
 	t.Run("uncapped gitea instance builds nothing", func(t *testing.T) {
 		cfg := &instance.Config{Repos: []instance.RepoRef{{
-			Provider: "gitea", Owner: "gerty", Name: "goobers-hew", BaseURL: "https://git.k3s.ca",
+			Provider: "gitea", Owner: "acme", Name: "widgets", BaseURL: "https://gitea.example.test",
 		}}}
 		uncapped := []apiv1.Workflow{{Spec: apiv1.WorkflowSpec{}}}
 		refresher, err := buildOpenPRRefresher(cfg, uncapped, &backlogTestRegistrar{}, nil, t.TempDir(), nil)

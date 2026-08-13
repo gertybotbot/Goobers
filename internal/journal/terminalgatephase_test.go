@@ -123,8 +123,8 @@ func TestPhaseFromEventsDistinguishesPendingHumanDecision(t *testing.T) {
 			want: PhaseAborted,
 		},
 		{
-			// The exact live shape on gerty/goobers-hew: the abort executed,
-			// then the terminal preparer 401'd, so no run.finished was written.
+			// The abort executed, then terminal preparation failed before
+			// run.finished could be written.
 			name: "executed abort whose terminal preparer failed is still terminal",
 			events: []Event{
 				{Type: EventRunStarted},
