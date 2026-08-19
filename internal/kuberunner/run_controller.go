@@ -92,6 +92,9 @@ type RunReconciler struct {
 	// ClaimNamespace is passed to workers so they assert the same centralized
 	// retained-claim authority as the controller.
 	ClaimNamespace string
+	// Notifications derives durable output requests from committed journal
+	// occurrences. It is optional and never participates in workflow decisions.
+	Notifications *JournalNotificationProjector
 }
 
 // MachineResolver resolves the pinned compiled machine for a run.
@@ -161,7 +164,18 @@ type StateMachine interface {
 //
 // Every step is idempotent. Re-running Reconcile from any point reaches the
 // same state without inventing an unjournalled transition.
-func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, reconcileErr error) {
+	// A notification projection failure must not become workflow authority: the
+	// reconcile still advances from the journal. It does, however, need another
+	// pass so a terminal run is not left without its durable output request.
+	notificationRetry := false
+	defer func() {
+		if notificationRetry && reconcileErr == nil && !result.Requeue &&
+			(result.RequeueAfter == 0 || result.RequeueAfter > time.Second) {
+			result.RequeueAfter = time.Second
+		}
+	}()
+
 	var run apiv1.GooberRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -180,6 +194,28 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 				fmt.Sprintf("no canonical journal for run %q", run.Spec.RunID))
 		}
 		return ctrl.Result{}, fmt.Errorf("read journal head: %w", err)
+	}
+
+	if r.Notifications != nil {
+		projection, notificationErr := r.Notifications.Project(ctx, string(run.UID), run.Spec.RunID)
+		if notificationErr != nil {
+			notificationRetry = true
+			log.FromContext(ctx).Error(notificationErr,
+				"durable notification projection failed; workflow authority is unaffected",
+				"runId", run.Spec.RunID)
+		} else if projection.Created > 0 {
+			// notification.requested is itself a committed journal event. Reread so
+			// status.observedSeq reflects it and every later decision uses one head.
+			head, err = r.Journal.Head(run.Spec.RunID)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("reread journal after notification publication: %w", err)
+			}
+		}
+		for _, wakeErr := range projection.WakeErrors {
+			log.FromContext(ctx).Error(wakeErr,
+				"advisory notification wake gossip failed; durable journal publication is unaffected",
+				"runId", run.Spec.RunID, "publicationSeq", projection.HighestSeq)
+		}
 	}
 
 	machine, err := r.Machine.Resolve(ctx, &run)

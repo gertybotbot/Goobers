@@ -1,7 +1,7 @@
-# Kubernetes-native runner — phase 3 slice
+# Kubernetes-native runner — phase 4 slice
 
-**Status:** implemented, fenced agent/provider execution seam
-**Scope:** `api/v1alpha1/gooberrun_types.go`, `api/v1alpha1/gooberrunaction_types.go`, `internal/kuberunner`, `providers`, `cmd/goober-attempt`
+**Status:** implemented, journal-derived durable notification publication
+**Scope:** `api/v1alpha1/gooberrun_types.go`, `api/v1alpha1/gooberrunaction_types.go`, `internal/kuberunner`, `internal/notification`, `providers`, `cmd/goober-attempt`
 
 This note records the authority boundaries the Kubernetes-native runner is built
 on, and states explicitly what this slice does **not** do. It is deliberately
@@ -207,7 +207,42 @@ Transport is a `ResultReader` interface; today it is a file on a shared volume.
 Swapping in an artifact store or broker later changes no correctness property,
 because none of the validation depends on where the bytes came from.
 
-## 8. Human gates
+## 8. Durable notification publication and advisory wake gossip
+
+Human-pause and terminal notifications are projections of committed journal
+occurrences. `JournalNotificationProjector` scans the canonical event log in
+sequence order and renders the existing provider-neutral
+`NotificationRequest` contract from `gate.paused` and `run.finished`. The
+request identity and idempotency key are deterministic functions of
+`(run ID, source journal sequence)`, and its expiry is derived from the source
+event time rather than controller wall-clock time.
+
+The request is appended as `notification.requested` to the same run journal.
+`EnsureNotificationRequested` rechecks the exact source occurrence while it
+owns the journal writer lock and atomically returns an existing publication or
+appends the first one. A controller crash before, during, or after publication
+therefore converges on one durable request. The first rendering wins: changing
+sink selection or TTL later cannot rewrite output history. Notification events
+remain excluded from workflow conformance and `HeadFromEvents` never consumes
+them to choose a state, attempt, terminal result, or claim disposition.
+
+Only after the request is durable may the projector emit a `WakeHint`. The hint
+contains run ID, Kubernetes run UID, source sequence, and publication sequence;
+it contains no workflow transition, result, claim token, or rendered message.
+Receivers use it only as a doorbell and must reread the journal. `WakeCoalescer`
+drops duplicate and stale hints by publication sequence and keys its high-water
+by run UID, so delayed gossip for a deleted/recreated CR cannot suppress its
+replacement. Gossip errors are diagnostic only: they neither roll back the
+request nor affect reconciliation. Replaying after restart may deliberately
+repeat the doorbell because gossip is lossy and advisory.
+
+The deployment selects registered sink kinds through operator options. This
+slice stops at the durable journal publication and transport-neutral wake seam;
+it does not invent a Kafka/Nisshi or NATS client where the repository has no
+production adapter. The existing `internal/notification` dispatcher remains the
+bounded, receipted sink-delivery boundary.
+
+## 9. Human gates
 
 A human gate executes no process, so it gets **no Job**. The controller appends
 `gate.paused` and projects phase `Waiting` with the pause occurrence. Parking is
@@ -216,7 +251,7 @@ idempotent: repeated reconciles do not append a `gate.paused` per pass.
 `Waiting` is an operational refinement of *running*, not a journal phase. It must
 never be read as a terminal outcome.
 
-## 9. Occurrence-bound actions
+## 10. Occurrence-bound actions
 
 Human actions arrive **late** by nature — a notification sits in a chat client
 and someone clicks an hour later. By then the run may have moved on, re-entered
@@ -237,7 +272,7 @@ identity, because one gate can pause many times in a single run.
 `Applied` and `Rejected` are terminal, so a requeue cannot journal a decision
 twice.
 
-## 10. Immutability
+## 11. Immutability
 
 Both CRD specs are immutable via CEL `self == oldSelf`.
 
@@ -252,7 +287,7 @@ Provider kind lives in the pinned spec deliberately: the live Gitea incident was
 caused by terminal/cleanup work routing to the wrong provider. A run must not be
 able to discover its provider from mutable config at a terminal seam.
 
-## 11. Explicit non-goals for this slice
+## 12. Explicit non-goals for this slice
 
 These are **absent, not stubbed**. Nothing in the tree should be mistaken for a
 partial implementation of any of them.
@@ -267,8 +302,10 @@ partial implementation of any of them.
   idempotency keys, and result receipts are evidence. The journal and retained
   business claim remain the only authorities; there is no mutation CRD or
   second state machine.
-- **No Nisshi / Kafka broker client.** No outbox, no topics, no consumer groups.
-- **No NATS.** No advisory subjects, no gossip, no wake-up hints.
+- **No invented broker adapter.** Durable notification requests use the existing
+  journal and notification contracts. The wake interface and stale-ordering
+  coalescer are ready for a real deployment adapter, but this slice does not
+  pretend that a test double is a Kafka/Nisshi producer or NATS client.
 - **No Temporal and no PostgreSQL.** `internal/engine` stays quarantined.
   Registering the runtime CRDs in the operator scheme does not activate it; the
   two runners share a scheme and nothing else. The native runner's only durable
@@ -284,7 +321,7 @@ partial implementation of any of them.
   make the controller easier. The canonical event taxonomy and runner
   conformance expectations are unchanged.
 
-## 12. What is verified
+## 13. What is verified
 
 - deterministic Job identity, including separation across runs, states,
   branches, attempts, and recreated CRs;
@@ -317,17 +354,25 @@ partial implementation of any of them.
   attempt;
 - stale `GooberRunAction` occurrence and run-UID are rejected with stable
   reasons;
+- pause and terminal notification requests are derived in journal order,
+  survive controller restart without duplicate publication, and retain their
+  first durable rendering across config changes;
+- wake gossip happens only after durable publication, gossip failure cannot
+  invalidate it, and duplicate/stale hints are coalesced per run UID;
 - the on-disk journal store and result transport round-trip against a real
   journal.
 
-## 13. Known gaps
+## 14. Known gaps
 
 - A Job that completes and never publishes is surfaced via a `ResultMissing`
   condition, but there is no timeout that converts it into a failed attempt yet.
 - `ttlSecondsAfterFinished` is not set: Jobs are retained because result and log
   retention are not yet proven.
+- No Kafka/Nisshi sink or NATS transport is wired. Adding one must use its real
+  client and authentication/configuration model; wake payloads remain advisory
+  and durable sink outcomes continue to use notification delivery receipts.
 
-## 14. Generator hazards worth remembering
+## 15. Generator hazards worth remembering
 
 Two controller-gen behaviours cost real debugging time here and will bite again:
 

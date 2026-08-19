@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	apiv1 "github.com/goobers/goobers/api/v1alpha1"
 	"github.com/goobers/goobers/internal/journal"
@@ -49,6 +50,7 @@ func (f *fakeJournal) seed(runID string) {
 		Schema: journal.EventSchema,
 		Seq:    1,
 		Type:   journal.EventRunStarted,
+		Time:   time.Now().UTC(),
 		Status: string(journal.PhaseRunning),
 	}}
 }
@@ -67,6 +69,7 @@ func (f *fakeJournal) append(runID string, ev journal.Event) (uint64, error) {
 	}
 	ev.Schema = journal.EventSchema
 	ev.Seq = uint64(len(existing)) + 1
+	ev.Time = time.Now().UTC()
 	f.events[runID] = append(existing, ev)
 	f.appends++
 	return ev.Seq, nil
@@ -99,8 +102,18 @@ func (f *fakeJournal) Head(runID string) (JournalHead, error) {
 	}
 	// Derive the head exactly as production does.
 	head := HeadFromEvents(snapshot)
-	head.Identity = journal.RunIdentity{RunID: runID}
+	head.Identity = journal.RunIdentity{RunID: runID, Workflow: "ship", Gaggle: "web"}
 	return head, nil
+}
+
+func (f *fakeJournal) Events(runID string) ([]journal.Event, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	events, ok := f.events[runID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrRunNotFound, runID)
+	}
+	return append([]journal.Event(nil), events...), nil
 }
 
 func (f *fakeJournal) AppendStageStarted(runID string, attempt AttemptID) (uint64, error) {
@@ -159,6 +172,31 @@ func (f *fakeJournal) AppendClaimReleased(runID string, token ClaimToken) (uint6
 		Type: journal.EventClaimReleased, Name: token.Key.ExternalID, Gaggle: token.Key.Gaggle, RunID: token.RunID,
 		Runner: map[string]any{"provider": token.Key.Provider, "externalId": token.Key.ExternalID, "runUid": token.RunUID, "fenceEpoch": fmt.Sprintf("%d", token.Epoch)},
 	})
+}
+
+func (f *fakeJournal) EnsureNotificationRequested(runID string, sourceSeq uint64, request apiv1.NotificationRequest) (uint64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	events, ok := f.events[runID]
+	if !ok {
+		return 0, false, fmt.Errorf("%w: %s", ErrRunNotFound, runID)
+	}
+	foundSource := false
+	for _, ev := range events {
+		if ev.Seq == sourceSeq && (ev.Type == journal.EventGatePaused || ev.Type == journal.EventRunFinished) {
+			foundSource = true
+		}
+		if ev.NotificationRequest != nil && ev.NotificationRequest.NotificationID == request.NotificationID {
+			return ev.Seq, false, nil
+		}
+	}
+	if !foundSource {
+		return 0, false, fmt.Errorf("source event %d is not publishable", sourceSeq)
+	}
+	ev := journal.Event{Schema: journal.EventSchema, Seq: uint64(len(events)) + 1, Type: journal.EventNotificationRequested, Time: time.Now().UTC(), NotificationRequest: &request}
+	f.events[runID] = append(events, ev)
+	f.appends++
+	return ev.Seq, true, nil
 }
 
 // fakeResults is an in-memory result transport.

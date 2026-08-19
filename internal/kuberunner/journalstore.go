@@ -117,6 +117,9 @@ func (h JournalHead) HasOpenAttempt() bool { return h.OpenStage != "" }
 type JournalStore interface {
 	// Head returns the authoritative view of a run.
 	Head(runID string) (JournalHead, error)
+	// Events returns one immutable snapshot of the committed event log. It is
+	// used by output projectors only; workflow decisions continue to use Head.
+	Events(runID string) ([]journal.Event, error)
 	// AppendStageStarted records dispatch intent for an attempt and returns the
 	// committed sequence. It is called BEFORE the Job is created.
 	AppendStageStarted(runID string, attempt AttemptID) (uint64, error)
@@ -131,6 +134,11 @@ type JournalStore interface {
 	AppendClaimAcquired(runID string, token ClaimToken) (uint64, error)
 	// AppendClaimReleased records terminal claim disposition after run.finished.
 	AppendClaimReleased(runID string, token ClaimToken) (uint64, error)
+	// EnsureNotificationRequested durably publishes a request derived from an
+	// exact workflow-event occurrence. The check and append are atomic under the
+	// journal writer lock, so restart or concurrent reconciliation cannot mint a
+	// second publication. Notification output is never workflow authority.
+	EnsureNotificationRequested(runID string, sourceSeq uint64, request apiv1.NotificationRequest) (seq uint64, created bool, err error)
 }
 
 // ErrRunNotFound means no journal exists for a run id.
@@ -157,31 +165,45 @@ func (s *FSJournalStore) runDir(runID string) (string, error) {
 
 // Head derives the authoritative view from the committed event log.
 func (s *FSJournalStore) Head(runID string) (JournalHead, error) {
-	dir, err := s.runDir(runID)
-	if err != nil {
-		return JournalHead{}, err
-	}
-	reader, err := journal.OpenRead(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return JournalHead{}, fmt.Errorf("%w: %s", ErrRunNotFound, runID)
-		}
-		return JournalHead{}, err
-	}
-	identity, err := reader.Identity()
-	if err != nil {
-		return JournalHead{}, err
-	}
-	// Read events ONCE and derive everything from that single snapshot. Reading
-	// the log twice (once for events, once for phase) can straddle a concurrent
-	// append and produce a head that never actually existed.
-	events, err := reader.Events()
+	identity, events, err := s.snapshot(runID)
 	if err != nil {
 		return JournalHead{}, err
 	}
 	head := HeadFromEvents(events)
 	head.Identity = identity
 	return head, nil
+}
+
+// Events returns a single committed event-log snapshot.
+func (s *FSJournalStore) Events(runID string) ([]journal.Event, error) {
+	_, events, err := s.snapshot(runID)
+	return events, err
+}
+
+func (s *FSJournalStore) snapshot(runID string) (journal.RunIdentity, []journal.Event, error) {
+	dir, err := s.runDir(runID)
+	if err != nil {
+		return journal.RunIdentity{}, nil, err
+	}
+	reader, err := journal.OpenRead(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return journal.RunIdentity{}, nil, fmt.Errorf("%w: %s", ErrRunNotFound, runID)
+		}
+		return journal.RunIdentity{}, nil, err
+	}
+	identity, err := reader.Identity()
+	if err != nil {
+		return journal.RunIdentity{}, nil, err
+	}
+	// Read events ONCE and derive everything from that single snapshot. Reading
+	// the log twice (once for events, once for phase) can straddle a concurrent
+	// append and produce a head that never actually existed.
+	events, err := reader.Events()
+	if err != nil {
+		return journal.RunIdentity{}, nil, err
+	}
+	return identity, events, nil
 }
 
 // HeadFromEvents derives a head from an already-read event slice. It is
@@ -405,6 +427,56 @@ func (s *FSJournalStore) AppendClaimAcquired(runID string, token ClaimToken) (ui
 
 func (s *FSJournalStore) AppendClaimReleased(runID string, token ClaimToken) (uint64, error) {
 	return s.appendClaimEvent(runID, journal.EventClaimReleased, token)
+}
+
+// EnsureNotificationRequested appends a deterministic output publication once.
+// The source occurrence is rechecked while this process owns the journal's
+// exclusive writer lock. A caller can therefore never publish a request for an
+// event that was absent from the canonical log, and a restarted controller
+// recovers the original request rather than rendering a replacement.
+func (s *FSJournalStore) EnsureNotificationRequested(runID string, sourceSeq uint64, request apiv1.NotificationRequest) (uint64, bool, error) {
+	var seq uint64
+	var created bool
+	err := s.withRun(runID, func(run *journal.Run) error {
+		reader, err := journal.OpenRead(run.Dir())
+		if err != nil {
+			return err
+		}
+		events, err := reader.Events()
+		if err != nil {
+			return err
+		}
+		foundSource := false
+		for _, ev := range events {
+			if ev.Seq == sourceSeq && (ev.Type == journal.EventGatePaused || ev.Type == journal.EventRunFinished) {
+				foundSource = true
+			}
+		}
+		if !foundSource {
+			return fmt.Errorf("kuberunner: notification source event %d is not a publishable journal occurrence", sourceSeq)
+		}
+		for _, ev := range events {
+			if ev.Type != journal.EventNotificationRequested || ev.NotificationRequest == nil ||
+				ev.NotificationRequest.NotificationID != request.NotificationID {
+				continue
+			}
+			// The first durable rendering wins. A config reload may change the
+			// selected sinks or TTL, but replay must recover the bytes published
+			// for this occurrence rather than rewrite output history.
+			seq = ev.Seq
+			return nil
+		}
+		if err := run.Append(journal.Event{
+			Type:                journal.EventNotificationRequested,
+			NotificationRequest: &request,
+		}); err != nil {
+			return err
+		}
+		seq = run.Seq()
+		created = true
+		return nil
+	})
+	return seq, created, err
 }
 
 func (s *FSJournalStore) appendClaimEvent(runID string, eventType journal.EventType, token ClaimToken) (uint64, error) {

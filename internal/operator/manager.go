@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"time"
 
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -46,6 +47,14 @@ type Options struct {
 	// GooberCapabilities supplies agentic reviewer gates with the referenced
 	// goober definition's declared grants.
 	GooberCapabilities map[string][]string
+	// NotificationSinks enables journal-derived durable notification requests
+	// for the named registered sink kinds. Empty disables projection.
+	NotificationSinks []string
+	// NotificationTTL bounds delivery eligibility from the source event time.
+	NotificationTTL time.Duration
+	// WakeGossip receives advisory post-publication hints. Receivers must reread
+	// the journal; the hint is never workflow authority.
+	WakeGossip kuberunner.WakeGossip
 }
 
 // DefaultOptions returns sane defaults for running in-cluster.
@@ -139,6 +148,16 @@ func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) err
 		CredentialBindings: opts.CredentialBindings,
 		GooberCapabilities: opts.GooberCapabilities,
 		WorkerImage:        opts.WorkerImage,
+	}
+	if len(opts.NotificationSinks) > 0 {
+		runReconciler.Notifications = &kuberunner.JournalNotificationProjector{
+			Journal: store,
+			Policy: kuberunner.NotificationProjectionPolicy{
+				Sinks: append([]string(nil), opts.NotificationSinks...),
+				TTL:   opts.NotificationTTL,
+			},
+			Gossip: opts.WakeGossip,
+		}
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup gooberrun reconciler: %w", err)
