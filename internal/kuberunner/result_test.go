@@ -111,6 +111,11 @@ func TestValidateResultRejectsBadReceipts(t *testing.T) {
 			wantErr: ErrResultMisaddressed,
 		},
 		{
+			name:    "stale fencing epoch",
+			mutate:  func(r *ResultReceipt) { r.Attempt.FenceEpoch++ },
+			wantErr: ErrResultMisaddressed,
+		},
+		{
 			// The digest must commit to the bytes actually published, or it is
 			// decoration rather than an integrity check.
 			name:    "digest does not match envelope",

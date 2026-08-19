@@ -17,7 +17,7 @@ import (
 // transition until that receipt validates against the attempt it was dispatched
 // for and against the bytes it claims to describe.
 //
-// This is deliberately the minimal shape for the first slice: the receipt is a
+// This is deliberately a minimal shape: the receipt is a
 // small JSON document the Job writes to a well-known path on a shared volume,
 // and the controller reads back. It is an interface (ResultReader) rather than
 // a hard-coded filesystem read so that a later slice can swap in an
@@ -25,9 +25,9 @@ import (
 //
 // What makes it safe is not where the bytes live, it is that:
 //
-//  1. the receipt names the exact attempt (run UID, state, attempt number) it
-//     belongs to, so a stale Job's late receipt cannot be mistaken for the
-//     current attempt's;
+//  1. the receipt names the exact attempt (run UID, state, attempt number,
+//     fencing epoch) it belongs to, so a stale Job's late receipt cannot be
+//     mistaken for the current attempt's;
 //  2. the envelope is digest-addressed — the receipt carries the sha256 of the
 //     canonical envelope bytes, and the controller recomputes it;
 //  3. every artifact pointer is digest-validated before it is journalled.
@@ -84,6 +84,9 @@ type AttemptID struct {
 	Attempt int `json:"attempt"`
 	// Branch is the parallel branch id (0 is the run's root branch).
 	Branch int `json:"branch,omitempty"`
+	// FenceEpoch is the monotonic business-claim epoch authorizing this worker.
+	// It is zero only for runs that do not target a claimable provider item.
+	FenceEpoch int64 `json:"fenceEpoch,omitempty"`
 }
 
 // Equal reports whether two attempt identities name the same attempt.
@@ -92,12 +95,13 @@ func (a AttemptID) Equal(b AttemptID) bool {
 		a.RunID == b.RunID &&
 		a.State == b.State &&
 		a.Attempt == b.Attempt &&
-		a.Branch == b.Branch
+		a.Branch == b.Branch &&
+		a.FenceEpoch == b.FenceEpoch
 }
 
 // String renders the attempt for logs and error messages.
 func (a AttemptID) String() string {
-	return fmt.Sprintf("run=%s/%s state=%s branch=%d attempt=%d", a.RunID, a.RunUID, a.State, a.Branch, a.Attempt)
+	return fmt.Sprintf("run=%s/%s state=%s branch=%d attempt=%d fence=%d", a.RunID, a.RunUID, a.State, a.Branch, a.Attempt, a.FenceEpoch)
 }
 
 // ResultReceipt is what an attempt Job publishes. Envelope holds the canonical

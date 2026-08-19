@@ -1,6 +1,6 @@
-# Kubernetes-native runner — phase 1 slice
+# Kubernetes-native runner — phase 2 slice
 
-**Status:** implemented, first vertical slice
+**Status:** implemented, durable business claims and fencing
 **Scope:** `api/v1alpha1/gooberrun_types.go`, `api/v1alpha1/gooberrunaction_types.go`, `internal/kuberunner`
 
 This note records the authority boundaries the Kubernetes-native runner is built
@@ -16,7 +16,7 @@ executes. Splitting decision from execution introduces exactly one new hazard �
 **the executor can lie, vanish, or come back from the dead** — and everything in
 this design is a response to it.
 
-The single rule the whole slice enforces:
+The single rule the runner enforces:
 
 > A committed journal transition may cause execution. Execution never creates
 > authoritative workflow state by itself.
@@ -48,7 +48,41 @@ exited 0 without publishing a usable result leaves the run exactly where it was.
 "The process exited 0" and "the stage decided this" are different claims, and
 only the second one may move a run.
 
-## 3. Deterministic attempt identity
+## 3. Durable business claims are not leader election
+
+An item-triggered run (a pinned repository with `externalId`) must acquire a
+business claim before it may dispatch. Claim identity is the full
+`(gaggle, provider, external ID)` tuple. The authority is a retained ConfigMap
+record named by a hash of that tuple in one configured authority namespace
+(`goobers-system` by default), updated with Kubernetes `resourceVersion`
+compare-and-swap. Centralizing the records keeps runs in different namespaces
+from acquiring parallel copies of one business claim. It is deliberately **not**
+a `coordination.k8s.io/Lease`:
+leader-election leases answer whether a controller process is live; a business
+claim answers which immutable run occurrence may act on a provider item.
+
+Each grant carries a positive, monotonically increasing fencing epoch. Released
+records are retained, and expiry/reacquisition increments rather than resets the
+epoch. Acquisition by the same `(run ID, run UID)` is idempotent and renews the
+same epoch, which is how a controller restart recovers without minting a second
+authority. Acquisition by another live holder is refused. Renewal, assertion,
+and release all compare key, run ID, run UID, epoch, and lease expiry; a stale
+worker fails closed.
+
+The claim grant is then appended to the run journal as `claim.acquired` before
+any `stage.started`. That event is the run's durable record of which fence it
+was granted. Reconciliation reconstructs it from the journal and renews the
+external claim record before every executable decision. Terminal ordering is
+the reverse: `run.finished` commits first, the claim is released second, and
+`claim.released` records that disposition last. Release is idempotent for the
+same retained epoch, closing the crash window between release and journalling
+the disposition.
+
+This split is intentional: the retained ConfigMap provides atomic contention
+between runs, while the append-only run journal remains workflow and recovery
+authority. `GooberRun.status` participates in neither decision.
+
+## 4. Deterministic attempt identity and journal-derived numbering
 
 The dangerous window is between *decide to dispatch* and *Job exists*. It is
 closed by ordering plus determinism:
@@ -78,7 +112,14 @@ Two details worth stating because they are easy to get wrong:
   looks authoritative and is not. `goobers.dev/state` is set only when the raw
   name is already a legal label value, and the reconciler never depends on it.
 
-## 4. Retry belongs to the controller
+Attempt numbers come exclusively from replaying `stage.started` events in the
+journal head. The highest attempt for `(state, branch)` plus one is the next
+number. Deleting status, restarting the controller, or restoring a stale status
+object therefore cannot reuse an attempt number. The full `status.attempts`
+list is also reconstructed from those events, including `dispatchedSeq`; it is
+not carried forward from old status.
+
+## 5. Retry belongs to the controller
 
 Every attempt Job is created with `backoffLimit: 0` and `restartPolicy: Never`.
 
@@ -88,15 +129,16 @@ entitled to publish into the same result slot, with one journal record covering
 both. Instead, each retry is a separate controller decision, a separate
 journalled attempt, and a separate deterministically-named Job.
 
-## 5. The result-publication contract
+## 6. The result-publication contract
 
 A Job publishes a `ResultReceipt`. The controller refuses to journal anything
 until the receipt passes, in this order:
 
 1. **Schema** — the receipt version is one this build owns; unknown fields are
    refused rather than ignored.
-2. **Address** — the receipt names the exact attempt
-   `(run UID, run ID, state, branch, attempt)` that was dispatched. This is what
+2. **Address and fence** — the receipt names the exact attempt
+   `(run UID, run ID, state, branch, attempt, fencing epoch)` that was
+   dispatched. This is what
    stops a stale worker from an earlier attempt writing into the live slot and
    being read as the current attempt succeeding.
 3. **Digest** — the envelope bytes are re-hashed and compared to the digest the
@@ -109,6 +151,11 @@ until the receipt passes, in this order:
 Only `ValidateResult` can construct a `ValidatedResult`, and only a
 `ValidatedResult` can be passed to `AppendStageFinished`. "Did we validate this?"
 is answered by the type system rather than by remembering to call a checker.
+Immediately before accepting that validated result, the controller reasserts
+that the attempt's claim epoch is still current. Thus even a well-formed late
+receipt from a worker whose lease expired cannot cross the journal mutation
+seam. The same assertion is the required entry point for any future
+provider-mutation broker; Phase 2 does not introduce provider mutation itself.
 
 Any failure is a **hard stop**: the run does not advance. Missing is
 distinguished from invalid, because conflating them either wedges a run forever
@@ -119,7 +166,7 @@ Transport is a `ResultReader` interface; today it is a file on a shared volume.
 Swapping in an artifact store or broker later changes no correctness property,
 because none of the validation depends on where the bytes came from.
 
-## 6. Human gates
+## 7. Human gates
 
 A human gate executes no process, so it gets **no Job**. The controller appends
 `gate.paused` and projects phase `Waiting` with the pause occurrence. Parking is
@@ -128,7 +175,7 @@ idempotent: repeated reconciles do not append a `gate.paused` per pass.
 `Waiting` is an operational refinement of *running*, not a journal phase. It must
 never be read as a terminal outcome.
 
-## 7. Occurrence-bound actions
+## 8. Occurrence-bound actions
 
 Human actions arrive **late** by nature — a notification sits in a chat client
 and someone clicks an hour later. By then the run may have moved on, re-entered
@@ -149,7 +196,7 @@ identity, because one gate can pause many times in a single run.
 `Applied` and `Rejected` are terminal, so a requeue cannot journal a decision
 twice.
 
-## 8. Immutability
+## 9. Immutability
 
 Both CRD specs are immutable via CEL `self == oldSelf`.
 
@@ -164,18 +211,14 @@ Provider kind lives in the pinned spec deliberately: the live Gitea incident was
 caused by terminal/cleanup work routing to the wrong provider. A run must not be
 able to discover its provider from mutable config at a terminal seam.
 
-## 9. Explicit non-goals for this slice
+## 10. Explicit non-goals for this slice
 
 These are **absent, not stubbed**. Nothing in the tree should be mistaken for a
 partial implementation of any of them.
 
-- **No durable claims and no fencing epochs.** There is no claim acquisition,
-  renewal, or release here. Kubernetes `Lease` objects are for controller leader
-  election and liveness only — they are *not* business-claim authority, and this
-  slice does not pretend otherwise by introducing one.
 - **No provider mutation broker.** No scoped write tokens, no idempotency
-  receipts, no epoch validation. Agentic and provider-writing stages are not
-  safe on this path yet.
+  receipts, or provider API client. Agentic and provider-writing stages remain
+  out of scope even though the fence they must validate now exists.
 - **No Nisshi / Kafka broker client.** No outbox, no topics, no consumer groups.
 - **No NATS.** No advisory subjects, no gossip, no wake-up hints.
 - **No Temporal and no PostgreSQL.** `internal/engine` stays quarantined.
@@ -193,7 +236,7 @@ partial implementation of any of them.
   make the controller easier. The canonical event taxonomy and runner
   conformance expectations are unchanged.
 
-## 10. What is verified
+## 11. What is verified
 
 - deterministic Job identity, including separation across runs, states,
   branches, attempts, and recreated CRs;
@@ -206,24 +249,25 @@ partial implementation of any of them.
   advances nothing;
 - a human gate creates no Job and projects `Waiting` with a pause occurrence;
 - status deleted and rebuilt from the journal repairs exactly, writing no events;
+- status deletion between retries still dispatches the journal-derived next
+  attempt and reconstructs both attempt refs;
+- concurrent claim refusal, same-run restart recovery, expiry takeover with a
+  strictly larger epoch, idempotent terminal release, and stale-token refusal;
+- a stale worker's otherwise valid receipt cannot commit `stage.finished` after
+  another run owns the next fencing epoch;
 - stale `GooberRunAction` occurrence and run-UID are rejected with stable
   reasons;
 - the on-disk journal store and result transport round-trip against a real
   journal.
 
-## 11. Known gaps
+## 12. Known gaps
 
-- `nextAttemptNumber` counts attempts from projected status. Status is a
-  projection, so an undercount is possible in principle; it is currently
-  self-correcting because the deterministic Job name collides and create-once
-  absorbs it. Deriving the attempt number from the journal head is the cleaner
-  fix and belongs in the next slice.
 - A Job that completes and never publishes is surfaced via a `ResultMissing`
   condition, but there is no timeout that converts it into a failed attempt yet.
 - `ttlSecondsAfterFinished` is not set: Jobs are retained because result and log
   retention are not yet proven.
 
-## 12. Generator hazards worth remembering
+## 13. Generator hazards worth remembering
 
 Two controller-gen behaviours cost real debugging time here and will bite again:
 

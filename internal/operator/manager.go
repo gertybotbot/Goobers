@@ -37,11 +37,14 @@ type Options struct {
 	ResultsDir string
 	// WorkerImage overrides the attempt container image.
 	WorkerImage string
+	// ClaimNamespace is the single namespace containing retained business-claim
+	// records. It must be shared by every watched GooberRun namespace.
+	ClaimNamespace string
 }
 
 // DefaultOptions returns sane defaults for running in-cluster.
 func DefaultOptions() Options {
-	return Options{MetricsAddr: ":8080", HealthAddr: ":8081", LeaderElection: false}
+	return Options{MetricsAddr: ":8080", HealthAddr: ":8081", LeaderElection: false, ClaimNamespace: kuberunner.DefaultClaimNamespace}
 }
 
 // Run builds the manager, wires the Gaggle reconciler, and blocks until ctx is
@@ -99,8 +102,9 @@ func Run(ctx context.Context, logger *slog.Logger, opts Options) error {
 //
 // This deliberately does NOT touch internal/engine: the Temporal runner stays
 // quarantined, and nothing here starts a Temporal client, a task-queue worker,
-// or a Postgres connection. The native runner's only durable dependency is the
-// same plain-file journal the local runner already owns.
+// or a Postgres connection. Workflow authority remains the same plain-file
+// journal the local runner already owns; retained ConfigMaps provide only the
+// atomic business-claim ledger and monotonic fencing epochs.
 func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) error {
 	if opts.RunsDir == "" {
 		logger.Info("kubernetes-native runner disabled (no runs directory configured)")
@@ -113,6 +117,10 @@ func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) err
 	}
 
 	store := kuberunner.NewFSJournalStore(opts.RunsDir)
+	claimNamespace := opts.ClaimNamespace
+	if claimNamespace == "" {
+		claimNamespace = kuberunner.DefaultClaimNamespace
+	}
 
 	runReconciler := &kuberunner.RunReconciler{
 		Client:      mgr.GetClient(),
@@ -120,6 +128,7 @@ func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) err
 		Journal:     store,
 		Results:     kuberunner.NewFSResultReader(resultsDir),
 		Machine:     kuberunner.StaticMachineResolver{},
+		Claims:      &kuberunner.KubeClaimStore{Client: mgr.GetClient(), Namespace: claimNamespace},
 		WorkerImage: opts.WorkerImage,
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
@@ -136,6 +145,6 @@ func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) err
 	}
 
 	logger.Info("kubernetes-native runner enabled",
-		"runsDir", opts.RunsDir, "resultsDir", resultsDir)
+		"runsDir", opts.RunsDir, "resultsDir", resultsDir, "claimNamespace", claimNamespace)
 	return nil
 }

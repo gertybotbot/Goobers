@@ -147,6 +147,20 @@ func (f *fakeJournal) AppendGatePaused(runID string, gate string, branch int) (u
 	})
 }
 
+func (f *fakeJournal) AppendClaimAcquired(runID string, token ClaimToken) (uint64, error) {
+	return f.append(runID, journal.Event{
+		Type: journal.EventClaimAcquired, Name: token.Key.ExternalID, Gaggle: token.Key.Gaggle, RunID: token.RunID,
+		Runner: map[string]any{"provider": token.Key.Provider, "externalId": token.Key.ExternalID, "runUid": token.RunUID, "fenceEpoch": fmt.Sprintf("%d", token.Epoch)},
+	})
+}
+
+func (f *fakeJournal) AppendClaimReleased(runID string, token ClaimToken) (uint64, error) {
+	return f.append(runID, journal.Event{
+		Type: journal.EventClaimReleased, Name: token.Key.ExternalID, Gaggle: token.Key.Gaggle, RunID: token.RunID,
+		Runner: map[string]any{"provider": token.Key.Provider, "externalId": token.Key.ExternalID, "runUid": token.RunUID, "fenceEpoch": fmt.Sprintf("%d", token.Epoch)},
+	})
+}
+
 // fakeResults is an in-memory result transport.
 type fakeResults struct {
 	mu   sync.Mutex

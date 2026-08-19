@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	apiv1 "github.com/goobers/goobers/api/v1alpha1"
 	"github.com/goobers/goobers/internal/journal"
@@ -67,6 +68,32 @@ type JournalHead struct {
 	TerminalStatus string
 	// LastErrorCode is the most recent journalled error classifier.
 	LastErrorCode string
+	// Attempts is the complete dispatch history reconstructed from
+	// stage.started. Attempt numbering and status projection both derive from
+	// this list; status is never an input.
+	Attempts []JournalAttempt
+	// Claim is the current business-claim fence recorded by claim.acquired.
+	// It is cleared only by claim.released.
+	Claim *ClaimToken
+}
+
+// JournalAttempt is one durable stage.started occurrence.
+type JournalAttempt struct {
+	State  string
+	Branch int
+	Number int
+	Seq    uint64
+}
+
+// NextAttempt returns the next 1-based attempt number from journal history.
+func (h JournalHead) NextAttempt(state string, branch int) int {
+	highest := 0
+	for _, attempt := range h.Attempts {
+		if attempt.State == state && attempt.Branch == branch && attempt.Number > highest {
+			highest = attempt.Number
+		}
+	}
+	return highest + 1
 }
 
 // IsTerminal reports whether a run.finished has been committed.
@@ -84,8 +111,9 @@ func (h JournalHead) HasOpenAttempt() bool { return h.OpenStage != "" }
 
 // JournalStore reads and appends the canonical journal. It is an interface so
 // the reconciler can be exercised without a filesystem, but the production
-// implementation is the plain on-disk journal: this slice adds no new durable
-// substrate.
+// implementation is the plain on-disk run journal. Business-claim contention
+// is a separate retained ConfigMap authority; it never replaces this workflow
+// record.
 type JournalStore interface {
 	// Head returns the authoritative view of a run.
 	Head(runID string) (JournalHead, error)
@@ -98,6 +126,11 @@ type JournalStore interface {
 	AppendRunFinished(runID string, status journal.RunPhase, target string) (uint64, error)
 	// AppendGatePaused records a run parking at a human gate.
 	AppendGatePaused(runID string, gate string, branch int) (uint64, error)
+	// AppendClaimAcquired durably binds a run to the fencing epoch granted by
+	// the business claim store. It is committed before any Job is dispatched.
+	AppendClaimAcquired(runID string, token ClaimToken) (uint64, error)
+	// AppendClaimReleased records terminal claim disposition after run.finished.
+	AppendClaimReleased(runID string, token ClaimToken) (uint64, error)
 }
 
 // ErrRunNotFound means no journal exists for a run id.
@@ -165,6 +198,9 @@ func HeadFromEvents(events []journal.Event) JournalHead {
 		case journal.EventRunStarted:
 			head.State = ""
 		case journal.EventStageStarted:
+			head.Attempts = append(head.Attempts, JournalAttempt{
+				State: ev.Stage, Branch: ev.Branch, Number: ev.Attempt, Seq: ev.Seq,
+			})
 			head.OpenStage = ev.Stage
 			head.OpenAttempt = ev.Attempt
 			head.OpenAttemptSeq = ev.Seq
@@ -207,9 +243,33 @@ func HeadFromEvents(events []journal.Event) JournalHead {
 			if ev.Error != nil {
 				head.LastErrorCode = ev.Error.Code
 			}
+		case journal.EventClaimAcquired:
+			if token, ok := claimTokenFromEvent(ev); ok {
+				head.Claim = &token
+			}
+		case journal.EventClaimReleased, journal.EventClaimForceReleased:
+			head.Claim = nil
 		}
 	}
 	return head
+}
+
+func claimTokenFromEvent(ev journal.Event) (ClaimToken, bool) {
+	if ev.Runner == nil {
+		return ClaimToken{}, false
+	}
+	epochText, ok := ev.Runner["fenceEpoch"].(string)
+	epoch, epochErr := strconv.ParseInt(epochText, 10, 64)
+	runUID, uidOK := ev.Runner["runUid"].(string)
+	provider, providerOK := ev.Runner["provider"].(string)
+	externalID, externalOK := ev.Runner["externalId"].(string)
+	if !ok || epochErr != nil || epoch < 1 || !uidOK || !providerOK || !externalOK || ev.Gaggle == "" || ev.RunID == "" {
+		return ClaimToken{}, false
+	}
+	return ClaimToken{
+		Key:   ClaimKey{Gaggle: ev.Gaggle, Provider: provider, ExternalID: externalID},
+		RunID: ev.RunID, RunUID: runUID, Epoch: epoch,
+	}, true
 }
 
 // withRun opens the run journal for append, runs fn, and closes it. Every
@@ -333,6 +393,31 @@ func (s *FSJournalStore) AppendGatePaused(runID string, gate string, branch int)
 			return err
 		}
 		run.SetMachineState(gate)
+		seq = run.Seq()
+		return nil
+	})
+	return seq, err
+}
+
+func (s *FSJournalStore) AppendClaimAcquired(runID string, token ClaimToken) (uint64, error) {
+	return s.appendClaimEvent(runID, journal.EventClaimAcquired, token)
+}
+
+func (s *FSJournalStore) AppendClaimReleased(runID string, token ClaimToken) (uint64, error) {
+	return s.appendClaimEvent(runID, journal.EventClaimReleased, token)
+}
+
+func (s *FSJournalStore) appendClaimEvent(runID string, eventType journal.EventType, token ClaimToken) (uint64, error) {
+	var seq uint64
+	err := s.withRun(runID, func(run *journal.Run) error {
+		if err := run.Append(journal.Event{
+			Type: eventType, Name: token.Key.ExternalID, Gaggle: token.Key.Gaggle,
+			RunID: token.RunID,
+			Runner: map[string]any{"provider": token.Key.Provider, "externalId": token.Key.ExternalID,
+				"runUid": token.RunUID, "fenceEpoch": strconv.FormatInt(token.Epoch, 10)},
+		}); err != nil {
+			return err
+		}
 		seq = run.Seq()
 		return nil
 	})

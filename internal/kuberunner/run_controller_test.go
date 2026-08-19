@@ -3,6 +3,7 @@ package kuberunner
 import (
 	"context"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -508,6 +509,143 @@ func TestFailedJobRetryIsControllerOwnedAndSeparatelyJournalled(t *testing.T) {
 	}
 }
 
+// Attempt numbering is journal authority. Losing the entire status projection
+// between attempts must not reuse attempt 1 or collide with its Job.
+func TestAttemptNumberComesFromJournalAfterStatusLoss(t *testing.T) {
+	h := newHarness(t)
+	h.machine.attempts["build"] = 2
+	h.reconcile()
+	first := h.attempt("build", 1)
+	h.failJob(JobName(first))
+	h.reconcile() // commits attempt 1 stage.finished
+
+	run := h.run()
+	run.Status = apiv1.GooberRunStatus{}
+	if err := h.client.Status().Update(context.Background(), run); err != nil {
+		t.Fatalf("delete status projection: %v", err)
+	}
+
+	h.reconcile()
+	second := h.attempt("build", 2)
+	names := map[string]bool{}
+	for _, job := range h.jobs() {
+		names[job.Name] = true
+	}
+	if !names[JobName(first)] || !names[JobName(second)] {
+		t.Fatalf("jobs after status loss = %v, want durable attempts 1 and 2", names)
+	}
+	if got := h.run().Status.Attempts; len(got) != 2 || got[0].DispatchedSeq == 0 || got[1].DispatchedSeq == 0 {
+		t.Fatalf("attempt projection was not rebuilt from stage.started events: %+v", got)
+	}
+}
+
+func TestClaimRecoveryAndStaleWorkerReceiptAreFenced(t *testing.T) {
+	h := newHarness(t)
+	now := time.Date(2026, 8, 19, 14, 0, 0, 0, time.UTC)
+	claims := &KubeClaimStore{Client: h.client, Now: func() time.Time { return now }}
+	run := h.run()
+	run.Spec.Repository = &apiv1.RepositoryIdentity{Provider: "github", ExternalID: "42"}
+	// The fake API does not enforce spec immutability, which lets this focused
+	// harness opt into business claims after construction.
+	if err := h.client.Update(context.Background(), run); err != nil {
+		t.Fatalf("add repository identity: %v", err)
+	}
+	h.reconciler.Claims = claims
+	h.reconciler.ClaimTTL = time.Minute
+
+	h.reconcile()                                    // acquire + journal claim.acquired
+	if res := h.reconcile(); res.RequeueAfter <= 0 { // recover journal fence and dispatch
+		t.Fatal("claimed quiet Job has no periodic renewal requeue")
+	}
+	head, err := h.journal.Head(testRunID)
+	if err != nil || head.Claim == nil || head.Claim.Epoch != 1 {
+		t.Fatalf("journal claim after dispatch = %+v, err=%v", head.Claim, err)
+	}
+	oldAttempt := h.attempt("build", 1)
+	oldAttempt.FenceEpoch = 1
+	if jobs := h.jobs(); len(jobs) != 1 {
+		t.Fatalf("jobs = %d, want 1", len(jobs))
+	}
+
+	// Simulate controller restart: a fresh reconciler has no process-local
+	// ownership state, yet renews epoch 1 from the journal and creates nothing.
+	restarted := *h.reconciler
+	h.reconciler = &restarted
+	h.reconcile()
+	if jobs := h.jobs(); len(jobs) != 1 {
+		t.Fatalf("restart created %d jobs, want exactly 1", len(jobs))
+	}
+	acquired := 0
+	for _, ev := range h.journal.snapshot(testRunID) {
+		if ev.Type == journal.EventClaimAcquired {
+			acquired++
+		}
+	}
+	if acquired != 1 {
+		t.Fatalf("restart journalled %d claim acquisitions, want 1", acquired)
+	}
+
+	// Let epoch 1 expire and grant epoch 2 to another run. The stale worker can
+	// still publish a correctly encoded epoch-1 receipt, but acceptance must
+	// fail before stage.finished is committed.
+	now = now.Add(2 * time.Minute)
+	key := ClaimKey{Gaggle: "web", Provider: "github", ExternalID: "42"}
+	if token, err := claims.Acquire(context.Background(), testNamespace, key, "run-2", "uid-2", time.Minute); err != nil || token.Epoch != 2 {
+		t.Fatalf("take over claim: token=%+v err=%v", token, err)
+	}
+	h.results.publish(t, oldAttempt, apiv1.ResultEnvelope{Status: apiv1.ResultSuccess})
+	before := len(h.journal.snapshot(testRunID))
+	h.reconcile()
+	after := h.journal.snapshot(testRunID)
+	if len(after) != before {
+		t.Fatalf("stale worker advanced journal: %d -> %d events", before, len(after))
+	}
+	for _, ev := range after {
+		if ev.Type == journal.EventStageFinished {
+			t.Fatal("stale epoch receipt committed stage.finished")
+		}
+	}
+	if !hasCondition(h.run().Status.Conditions, apiv1.GooberRunConditionReady, metav1.ConditionFalse, "ClaimFenceLost") {
+		t.Fatalf("missing ClaimFenceLost condition: %+v", h.run().Status.Conditions)
+	}
+}
+
+func TestTerminalRunCommitsBeforeBusinessClaimRelease(t *testing.T) {
+	h := newHarness(t)
+	now := time.Date(2026, 8, 19, 14, 0, 0, 0, time.UTC)
+	claims := &KubeClaimStore{Client: h.client, Now: func() time.Time { return now }}
+	run := h.run()
+	run.Spec.Repository = &apiv1.RepositoryIdentity{Provider: "github", ExternalID: "42"}
+	if err := h.client.Update(context.Background(), run); err != nil {
+		t.Fatalf("add repository identity: %v", err)
+	}
+	h.reconciler.Claims, h.reconciler.ClaimTTL = claims, time.Minute
+	h.reconcile() // claim
+	h.reconcile() // dispatch
+	attempt := h.attempt("build", 1)
+	attempt.FenceEpoch = 1
+	h.results.publish(t, attempt, apiv1.ResultEnvelope{Status: apiv1.ResultSuccess})
+	h.reconcileUntilStable(10)
+
+	types := h.journal.types(testRunID)
+	runFinished, claimReleased := -1, -1
+	for i, eventType := range types {
+		if eventType == journal.EventRunFinished {
+			runFinished = i
+		}
+		if eventType == journal.EventClaimReleased {
+			claimReleased = i
+		}
+	}
+	if runFinished < 0 || claimReleased < 0 || runFinished >= claimReleased {
+		t.Fatalf("terminal claim ordering = %v, want run.finished before claim.released", types)
+	}
+	key := ClaimKey{Gaggle: "web", Provider: "github", ExternalID: "42"}
+	if token, err := claims.Acquire(context.Background(), testNamespace, key, "run-2", "uid-2", time.Minute); err != nil || token.Epoch != 2 {
+		t.Fatalf("claim after terminal release: token=%+v err=%v", token, err)
+	}
+}
+
 func TestExhaustedRetriesTerminalizeTheRun(t *testing.T) {
 	h := newHarness(t)
 	// Default MaxAttempts is 1: the first failure exhausts the budget.
@@ -569,6 +707,9 @@ func TestStatusRebuildsExactlyFromTheJournal(t *testing.T) {
 	}
 
 	after := h.run().Status
+	if !statusEqual(after, *before) {
+		t.Errorf("status after journal rebuild differs from original\nafter:  %+v\nbefore: %+v", after, *before)
+	}
 	if after.Phase != before.Phase {
 		t.Errorf("phase after rebuild = %q, want %q", after.Phase, before.Phase)
 	}
@@ -591,8 +732,8 @@ func TestProjectStatusIsPure(t *testing.T) {
 		State:          "@complete",
 		TerminalStatus: "completed",
 	}
-	first := ProjectStatus(head, 3, nil)
-	second := ProjectStatus(head, 3, nil)
+	first := ProjectStatus(head, 3, testRunUID, testRunID)
+	second := ProjectStatus(head, 3, testRunUID, testRunID)
 
 	if !statusEqual(first, second) {
 		t.Fatal("ProjectStatus is not a pure function of its inputs")

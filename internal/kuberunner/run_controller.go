@@ -28,13 +28,12 @@
 // name; creating it again returns AlreadyExists, which is treated as success.
 // No attempt is ever dispatched twice, and no dispatch is ever lost.
 //
-// # Non-goals for this slice
+// # Business fencing
 //
-// See docs/design/kubernetes-native-runner.md. In short: no durable claims or
-// fencing epochs, no Nisshi broker client, no NATS, no Temporal, no Postgres,
-// and no live-cluster canary. Those are later phases and are deliberately
-// absent rather than stubbed, so nothing here can be mistaken for a claim
-// implementation that does not exist yet.
+// Provider-item runs acquire a durable business claim before dispatch. The
+// claim's monotonic epoch is carried by the Job and result receipt, and is
+// revalidated immediately before result acceptance. Kubernetes leader-election
+// Leases remain liveness machinery and are never business authority.
 package kuberunner
 
 import (
@@ -42,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -72,6 +72,11 @@ type RunReconciler struct {
 	Results ResultReader
 	// Machine resolves the pinned workflow machine for a run. It is required.
 	Machine MachineResolver
+	// Claims is durable provider-item ownership. It is required for runs whose
+	// pinned repository identity has an ExternalID.
+	Claims ClaimStore
+	// ClaimTTL controls renewal cadence. Zero selects defaultClaimTTL.
+	ClaimTTL time.Duration
 	// WorkerImage overrides the attempt container image.
 	WorkerImage string
 }
@@ -128,6 +133,7 @@ type StateMachine interface {
 // +kubebuilder:rbac:groups=goobers.dev,resources=gooberrunactions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=goobers.dev,resources=gooberrunactions/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 
 // Reconcile advances one GooberRun.
 //
@@ -168,6 +174,25 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, fmt.Errorf("resolve pinned machine: %w", err)
 	}
 
+	// Business claims are acquired and renewed from durable authority before
+	// any executable decision. The journal records the granted epoch so a new
+	// controller process recovers the same fence rather than trusting status.
+	if key, required := businessClaimKey(&run); required {
+		if head.IsTerminal() {
+			return r.disposeTerminalClaim(ctx, &run, head)
+		}
+		ready, result, claimErr := r.ensureBusinessClaim(ctx, &run, head, key)
+		if claimErr != nil || !ready {
+			return result, claimErr
+		}
+		// Re-read after acquisition because the newly committed claim event is
+		// authoritative input to every later attempt identity.
+		head, err = r.Journal.Head(run.Spec.RunID)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("reread journal after claim: %w", err)
+		}
+	}
+
 	// Step 2: terminal runs are done. No Job, no advancement, just projection.
 	if head.IsTerminal() {
 		return ctrl.Result{}, r.project(ctx, &run, head)
@@ -176,7 +201,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	// Step 3: a human gate waits. It executes no process, so creating a Job for
 	// it would be a category error — there is nothing to run.
 	if head.Wait == WaitHumanGate {
-		return ctrl.Result{}, r.project(ctx, &run, head)
+		return r.claimRenewalResult(&run), r.project(ctx, &run, head)
 	}
 
 	// Step 4: an open attempt is judged by its result, never by Job status.
@@ -188,6 +213,10 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	state := head.State
 	if state == "" {
 		state = machine.Start()
+	}
+	if err := r.assertHeadFence(ctx, &run, head); err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, &run, "ClaimFenceLost",
+			fmt.Sprintf("run no longer holds the current business fence: %v", err))
 	}
 
 	switch machine.Kind(state) {
@@ -209,14 +238,14 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	case StateAutomatedGate:
 		// Not evaluated in this slice. Parking is the honest behaviour: an
 		// unevaluated gate must not be silently treated as a pass.
-		return ctrl.Result{}, r.projectNotReady(ctx, &run, "AutomatedGateUnsupported",
+		return r.claimRenewalResult(&run), r.projectNotReady(ctx, &run, "AutomatedGateUnsupported",
 			fmt.Sprintf("automated gate %q is not evaluated by this slice", state))
 
 	case StateTask:
 		return r.dispatchAttempt(ctx, &run, head, state)
 
 	default:
-		return ctrl.Result{}, r.projectNotReady(ctx, &run, "UnknownState",
+		return r.claimRenewalResult(&run), r.projectNotReady(ctx, &run, "UnknownState",
 			fmt.Sprintf("state %q is not present in the pinned machine", state))
 	}
 }
@@ -233,11 +262,12 @@ func (r *RunReconciler) judgeOpenAttempt(ctx context.Context, run *apiv1.GooberR
 	logger := log.FromContext(ctx)
 
 	attempt := AttemptID{
-		RunUID:  string(run.UID),
-		RunID:   run.Spec.RunID,
-		State:   head.OpenStage,
-		Attempt: head.OpenAttempt,
-		Branch:  head.Branch,
+		RunUID:     string(run.UID),
+		RunID:      run.Spec.RunID,
+		State:      head.OpenStage,
+		Attempt:    head.OpenAttempt,
+		Branch:     head.Branch,
+		FenceEpoch: claimEpoch(head),
 	}
 
 	// Try the result FIRST, before looking at the Job at all. A result that
@@ -255,7 +285,7 @@ func (r *RunReconciler) judgeOpenAttempt(ctx context.Context, run *apiv1.GooberR
 		// not advance and an operator must look.
 		logger.Error(valErr, "attempt published an invalid result; refusing to advance",
 			"attempt", attempt.String())
-		return ctrl.Result{}, r.projectNotReady(ctx, run, "InvalidResult",
+		return r.claimRenewalResult(run), r.projectNotReady(ctx, run, "InvalidResult",
 			fmt.Sprintf("attempt %s published an unusable result: %v", attempt.String(), valErr))
 	}
 	if !errors.Is(readErr, ErrResultMissing) {
@@ -291,10 +321,10 @@ func (r *RunReconciler) judgeOpenAttempt(ctx context.Context, run *apiv1.GooberR
 	// applies once the Job is observed failed, and a completed-but-silent Job
 	// is surfaced rather than guessed at.
 	if jobSucceeded(&job) {
-		return ctrl.Result{}, r.projectNotReady(ctx, run, "ResultMissing",
+		return r.claimRenewalResult(run), r.projectNotReady(ctx, run, "ResultMissing",
 			fmt.Sprintf("attempt %s job completed without publishing a result", attempt.String()))
 	}
-	return ctrl.Result{}, r.project(ctx, run, head)
+	return r.claimRenewalResult(run), r.project(ctx, run, head)
 }
 
 // commitAttempt journals a validated result and, when the transition
@@ -304,6 +334,10 @@ func (r *RunReconciler) judgeOpenAttempt(ctx context.Context, run *apiv1.GooberR
 // and both commit before status is projected. A reader replaying the journal
 // therefore always sees the stage settle before the run does.
 func (r *RunReconciler) commitAttempt(ctx context.Context, run *apiv1.GooberRun, attempt AttemptID, result ValidatedResult, machine StateMachine) (ctrl.Result, error) {
+	if err := r.assertAttemptFence(ctx, run, attempt); err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimFenceLost",
+			fmt.Sprintf("attempt %s no longer holds the current business fence: %v", attempt.String(), err))
+	}
 	if _, err := r.Journal.AppendStageFinished(run.Spec.RunID, attempt, result); err != nil {
 		return ctrl.Result{}, fmt.Errorf("commit stage.finished: %w", err)
 	}
@@ -325,6 +359,10 @@ func (r *RunReconciler) commitAttempt(ctx context.Context, run *apiv1.GooberRun,
 
 // handleFailedAttempt applies the controller's retry decision.
 func (r *RunReconciler) handleFailedAttempt(ctx context.Context, run *apiv1.GooberRun, attempt AttemptID, machine StateMachine) (ctrl.Result, error) {
+	if err := r.assertAttemptFence(ctx, run, attempt); err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimFenceLost",
+			fmt.Sprintf("failed attempt %s no longer holds the current business fence: %v", attempt.String(), err))
+	}
 	// Close the failed attempt in the journal so the retry is a visibly
 	// separate attempt rather than an unexplained second Job.
 	failed := ValidatedResult{
@@ -358,11 +396,12 @@ func (r *RunReconciler) handleFailedAttempt(ctx context.Context, run *apiv1.Goob
 // dispatchAttempt opens a new attempt: append intent, then create the Job.
 func (r *RunReconciler) dispatchAttempt(ctx context.Context, run *apiv1.GooberRun, head JournalHead, state string) (ctrl.Result, error) {
 	attempt := AttemptID{
-		RunUID:  string(run.UID),
-		RunID:   run.Spec.RunID,
-		State:   state,
-		Attempt: nextAttemptNumber(run, state, head.Branch),
-		Branch:  head.Branch,
+		RunUID:     string(run.UID),
+		RunID:      run.Spec.RunID,
+		State:      state,
+		Attempt:    head.NextAttempt(state, head.Branch),
+		Branch:     head.Branch,
+		FenceEpoch: claimEpoch(head),
 	}
 
 	// Intent is journalled BEFORE the Job exists. If the process dies here, the
@@ -377,6 +416,10 @@ func (r *RunReconciler) dispatchAttempt(ctx context.Context, run *apiv1.GooberRu
 // createAttemptJob creates the deterministically-named Job, treating an
 // existing one as success.
 func (r *RunReconciler) createAttemptJob(ctx context.Context, run *apiv1.GooberRun, attempt AttemptID) (ctrl.Result, error) {
+	if err := r.assertAttemptFence(ctx, run, attempt); err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimFenceLost",
+			fmt.Sprintf("refusing to dispatch %s without the current business fence: %v", attempt.String(), err))
+	}
 	job := r.desiredJob(run, attempt)
 	if err := controllerutil.SetControllerReference(run, job, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set owner reference: %w", err)
@@ -393,12 +436,11 @@ func (r *RunReconciler) createAttemptJob(ctx context.Context, run *apiv1.GooberR
 		return ctrl.Result{}, fmt.Errorf("create attempt job: %w", err)
 	}
 
-	recordAttempt(run, attempt, job.Name)
 	head, headErr := r.Journal.Head(run.Spec.RunID)
 	if headErr != nil {
 		return ctrl.Result{}, fmt.Errorf("reread journal head: %w", headErr)
 	}
-	return ctrl.Result{}, r.project(ctx, run, head)
+	return r.claimRenewalResult(run), r.project(ctx, run, head)
 }
 
 // desiredJob builds the attempt Job.
@@ -437,6 +479,7 @@ func (r *RunReconciler) desiredJob(run *apiv1.GooberRun, attempt AttemptID) *bat
 							{Name: "GOOBERS_STATE", Value: attempt.State},
 							{Name: "GOOBERS_ATTEMPT", Value: fmt.Sprintf("%d", attempt.Attempt)},
 							{Name: "GOOBERS_BRANCH", Value: fmt.Sprintf("%d", attempt.Branch)},
+							{Name: "GOOBERS_FENCE_EPOCH", Value: fmt.Sprintf("%d", attempt.FenceEpoch)},
 							{Name: "GOOBERS_RESULT_PATH", Value: ResultMountPath + "/" + ResultFileName},
 							{Name: "GOOBERS_JOURNAL_ROOT", Value: run.Spec.JournalRoot},
 						},
@@ -467,42 +510,6 @@ func (r *RunReconciler) workerImage(run *apiv1.GooberRun) string {
 	return DefaultWorkerImage
 }
 
-// nextAttemptNumber derives the attempt number for a fresh dispatch by counting
-// the attempts already projected for this state. Status is a projection, but
-// this is a safe use of it: the number only ever grows, and an undercount is
-// corrected by the deterministic Job name colliding, which is handled as
-// create-once rather than as an error.
-func nextAttemptNumber(run *apiv1.GooberRun, state string, branch int) int {
-	highest := 0
-	for _, ref := range run.Status.Attempts {
-		if ref.State == state && int(ref.Branch) == branch && int(ref.Attempt) > highest {
-			highest = int(ref.Attempt)
-		}
-	}
-	return highest + 1
-}
-
-// recordAttempt adds an attempt to the in-memory projection, replacing any
-// existing entry for the same Job name so repeated reconciles do not duplicate.
-func recordAttempt(run *apiv1.GooberRun, attempt AttemptID, jobName string) {
-	ref := apiv1.AttemptRef{
-		JobName: jobName,
-		State:   attempt.State,
-		Attempt: int32(attempt.Attempt),
-		Branch:  int32(attempt.Branch),
-	}
-	if attempt.Attempt > 1 {
-		ref.AttemptClass = string(journal.AttemptPolicy)
-	}
-	for i := range run.Status.Attempts {
-		if run.Status.Attempts[i].JobName == jobName {
-			run.Status.Attempts[i] = ref
-			return
-		}
-	}
-	run.Status.Attempts = append(run.Status.Attempts, ref)
-}
-
 // requeueAfterJournalWrite reprojects immediately after a journal commit, so
 // the next decision is made against the head that commit produced rather than a
 // stale one.
@@ -523,7 +530,7 @@ func (r *RunReconciler) requeueAfterJournalWrite(ctx context.Context, run *apiv1
 // which is what makes "delete status and rebuild it exactly" true by
 // construction rather than by careful maintenance.
 func (r *RunReconciler) project(ctx context.Context, run *apiv1.GooberRun, head JournalHead) error {
-	desired := ProjectStatus(head, run.Generation, run.Status.Attempts)
+	desired := ProjectStatus(head, run.Generation, string(run.UID), run.Spec.RunID)
 	return r.applyStatus(ctx, run, desired)
 }
 
@@ -534,7 +541,7 @@ func (r *RunReconciler) projectNotReady(ctx context.Context, run *apiv1.GooberRu
 	if err != nil && !errors.Is(err, ErrRunNotFound) {
 		return fmt.Errorf("read journal head: %w", err)
 	}
-	desired := ProjectStatus(head, run.Generation, run.Status.Attempts)
+	desired := ProjectStatus(head, run.Generation, string(run.UID), run.Spec.RunID)
 	apimeta.SetStatusCondition(&desired.Conditions, metav1.Condition{
 		Type:               apiv1.GooberRunConditionReady,
 		Status:             metav1.ConditionFalse,
@@ -561,7 +568,7 @@ func (r *RunReconciler) applyStatus(ctx context.Context, run *apiv1.GooberRun, d
 // It is exported and pure so that the repair property is directly testable:
 // ProjectStatus(head) must equal the status a live reconcile produced, and
 // wiping status changes nothing about its output.
-func ProjectStatus(head JournalHead, generation int64, attempts []apiv1.AttemptRef) apiv1.GooberRunStatus {
+func ProjectStatus(head JournalHead, generation int64, runUID, runID string) apiv1.GooberRunStatus {
 	status := apiv1.GooberRunStatus{
 		ObservedGeneration: generation,
 		Phase:              ProjectPhase(head),
@@ -571,8 +578,15 @@ func ProjectStatus(head JournalHead, generation int64, attempts []apiv1.AttemptR
 		LastErrorCode:      head.LastErrorCode,
 	}
 
-	if len(attempts) > 0 {
-		status.Attempts = append([]apiv1.AttemptRef(nil), attempts...)
+	if len(head.Attempts) > 0 {
+		for _, durable := range head.Attempts {
+			attempt := AttemptID{RunUID: runUID, RunID: runID, State: durable.State, Attempt: durable.Number, Branch: durable.Branch}
+			ref := apiv1.AttemptRef{JobName: JobName(attempt), State: durable.State, Attempt: int32(durable.Number), Branch: int32(durable.Branch), DispatchedSeq: projectSeq(durable.Seq)}
+			if durable.Number > 1 {
+				ref.AttemptClass = string(journal.AttemptPolicy)
+			}
+			status.Attempts = append(status.Attempts, ref)
+		}
 		sort.SliceStable(status.Attempts, func(i, j int) bool {
 			return status.Attempts[i].JobName < status.Attempts[j].JobName
 		})
@@ -608,6 +622,112 @@ func ProjectStatus(head JournalHead, generation int64, attempts []apiv1.AttemptR
 	apimeta.SetStatusCondition(&status.Conditions, ready)
 	apimeta.SetStatusCondition(&status.Conditions, settled)
 	return status
+}
+
+func businessClaimKey(run *apiv1.GooberRun) (ClaimKey, bool) {
+	if run.Spec.Repository == nil || run.Spec.Repository.ExternalID == "" {
+		return ClaimKey{}, false
+	}
+	return ClaimKey{Gaggle: run.Spec.Gaggle, Provider: run.Spec.Repository.Provider, ExternalID: run.Spec.Repository.ExternalID}, true
+}
+
+func claimEpoch(head JournalHead) int64 {
+	if head.Claim == nil {
+		return 0
+	}
+	return head.Claim.Epoch
+}
+
+func (r *RunReconciler) claimTTL() time.Duration {
+	if r.ClaimTTL > 0 {
+		return r.ClaimTTL
+	}
+	return defaultClaimTTL
+}
+
+// claimRenewalResult makes lease renewal independent of watch traffic. A Job
+// may run quietly for longer than the claim TTL, and a human gate may receive
+// no Kubernetes events at all; neither is permission for the fence to expire.
+func (r *RunReconciler) claimRenewalResult(run *apiv1.GooberRun) ctrl.Result {
+	if _, required := businessClaimKey(run); !required {
+		return ctrl.Result{}
+	}
+	return ctrl.Result{RequeueAfter: r.claimTTL() / 3}
+}
+
+func (r *RunReconciler) ensureBusinessClaim(ctx context.Context, run *apiv1.GooberRun, head JournalHead, key ClaimKey) (bool, ctrl.Result, error) {
+	if r.Claims == nil {
+		return false, ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimStoreUnavailable", "provider-item run requires durable business-claim authority")
+	}
+	if head.Claim == nil {
+		token, err := r.Claims.Acquire(ctx, run.Namespace, key, run.Spec.RunID, string(run.UID), r.claimTTL())
+		if err != nil {
+			if errors.Is(err, ErrClaimHeld) || errors.Is(err, ErrClaimContention) {
+				return false, ctrl.Result{RequeueAfter: r.claimTTL() / 4}, r.projectNotReady(ctx, run, "ClaimHeld", err.Error())
+			}
+			return false, ctrl.Result{}, fmt.Errorf("acquire business claim: %w", err)
+		}
+		if _, err := r.Journal.AppendClaimAcquired(run.Spec.RunID, token); err != nil {
+			return false, ctrl.Result{}, fmt.Errorf("commit claim.acquired: %w", err)
+		}
+		res, err := r.requeueAfterJournalWrite(ctx, run)
+		return false, res, err
+	}
+	if head.Claim.Key != key || head.Claim.RunID != run.Spec.RunID || head.Claim.RunUID != string(run.UID) {
+		return false, ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimFenceLost", "journal claim does not identify this run occurrence")
+	}
+	if _, err := r.Claims.Renew(ctx, run.Namespace, *head.Claim, r.claimTTL()); err != nil {
+		if errors.Is(err, ErrClaimFenceLost) || errors.Is(err, ErrClaimContention) {
+			return false, ctrl.Result{RequeueAfter: r.claimTTL() / 4}, r.projectNotReady(ctx, run, "ClaimFenceLost", err.Error())
+		}
+		return false, ctrl.Result{}, fmt.Errorf("renew business claim: %w", err)
+	}
+	return true, ctrl.Result{}, nil
+}
+
+func (r *RunReconciler) assertAttemptFence(ctx context.Context, run *apiv1.GooberRun, attempt AttemptID) error {
+	key, required := businessClaimKey(run)
+	if !required {
+		return nil
+	}
+	if r.Claims == nil || attempt.FenceEpoch == 0 {
+		return ErrClaimFenceLost
+	}
+	return r.Claims.AssertCurrent(ctx, run.Namespace, ClaimToken{Key: key, RunID: run.Spec.RunID, RunUID: string(run.UID), Epoch: attempt.FenceEpoch})
+}
+
+func (r *RunReconciler) assertHeadFence(ctx context.Context, run *apiv1.GooberRun, head JournalHead) error {
+	key, required := businessClaimKey(run)
+	if !required {
+		return nil
+	}
+	if r.Claims == nil || head.Claim == nil {
+		return ErrClaimFenceLost
+	}
+	token := *head.Claim
+	if token.Key != key || token.RunID != run.Spec.RunID || token.RunUID != string(run.UID) {
+		return ErrClaimFenceLost
+	}
+	return r.Claims.AssertCurrent(ctx, run.Namespace, token)
+}
+
+func (r *RunReconciler) disposeTerminalClaim(ctx context.Context, run *apiv1.GooberRun, head JournalHead) (ctrl.Result, error) {
+	if head.Claim == nil {
+		return ctrl.Result{}, r.project(ctx, run, head)
+	}
+	if r.Claims == nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimStoreUnavailable", "terminal claim cannot be released without durable authority")
+	}
+	if err := r.Claims.Release(ctx, run.Namespace, *head.Claim); err != nil {
+		if errors.Is(err, ErrClaimFenceLost) {
+			return ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimFenceLost", "terminal run no longer owns its recorded business fence")
+		}
+		return ctrl.Result{}, fmt.Errorf("release terminal business claim: %w", err)
+	}
+	if _, err := r.Journal.AppendClaimReleased(run.Spec.RunID, *head.Claim); err != nil {
+		return ctrl.Result{}, fmt.Errorf("commit claim.released: %w", err)
+	}
+	return r.requeueAfterJournalWrite(ctx, run)
 }
 
 // statusEqual compares projections ignoring condition timestamps, which are

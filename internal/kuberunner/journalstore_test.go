@@ -116,6 +116,43 @@ func TestFSJournalStoreRejectsUnknownAndUnsafeRuns(t *testing.T) {
 	}
 }
 
+func TestFSJournalStoreRecoversClaimFenceAndAttemptHighWater(t *testing.T) {
+	store, runID := newRealJournal(t)
+	token := ClaimToken{Key: ClaimKey{Gaggle: "web", Provider: "github", ExternalID: "42"}, RunID: runID, RunUID: "uid-1", Epoch: 7}
+	if _, err := store.AppendClaimAcquired(runID, token); err != nil {
+		t.Fatalf("append claim.acquired: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		if _, err := store.AppendStageStarted(runID, AttemptID{RunUID: "uid-1", RunID: runID, State: "build", Attempt: i, FenceEpoch: 7}); err != nil {
+			t.Fatalf("append attempt %d: %v", i, err)
+		}
+	}
+
+	// A new store instance simulates process restart and must recover both
+	// authority facts from bytes, without status or process memory.
+	restarted := NewFSJournalStore(store.RunsDir)
+	head, err := restarted.Head(runID)
+	if err != nil {
+		t.Fatalf("restart head: %v", err)
+	}
+	if head.Claim == nil || !head.Claim.Equal(token) {
+		t.Fatalf("recovered claim = %+v, want %+v", head.Claim, token)
+	}
+	if got := head.NextAttempt("build", 0); got != 3 {
+		t.Fatalf("next attempt = %d, want 3 from journal high-water", got)
+	}
+	if _, err := restarted.AppendClaimReleased(runID, token); err != nil {
+		t.Fatalf("append claim.released: %v", err)
+	}
+	head, err = restarted.Head(runID)
+	if err != nil {
+		t.Fatalf("head after release: %v", err)
+	}
+	if head.Claim != nil {
+		t.Fatalf("released claim still active in head: %+v", head.Claim)
+	}
+}
+
 // HeadFromEvents is the shared derivation used by both the production store and
 // the reconciler tests, so its rules are pinned directly.
 func TestHeadFromEventsDerivation(t *testing.T) {
