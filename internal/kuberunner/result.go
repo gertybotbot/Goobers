@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	apiv1 "github.com/goobers/goobers/api/v1alpha1"
 )
@@ -67,6 +68,10 @@ var (
 	// ErrResultInvalid means the receipt decoded and addressed correctly but its
 	// contents are not a usable stage result.
 	ErrResultInvalid = errors.New("kuberunner: result receipt is invalid")
+	// ErrResultConflict means the immutable result slot already contains a
+	// different valid receipt. Publishers may repeat the same bytes after a
+	// restart, but may never replace a previously published outcome.
+	ErrResultConflict = errors.New("kuberunner: result receipt conflicts with an existing outcome")
 )
 
 // AttemptID names one executable attempt. It is the binding identity shared by
@@ -162,6 +167,9 @@ func ValidateResult(want AttemptID, raw []byte) (ValidatedResult, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&receipt); err != nil {
 		return ValidatedResult{}, fmt.Errorf("%w: %v", ErrResultMalformed, err)
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return ValidatedResult{}, fmt.Errorf("%w: trailing JSON value", ErrResultMalformed)
 	}
 
 	if receipt.Schema != ResultReceiptVersion {

@@ -1,8 +1,8 @@
 # Goobers container image (docs/design/k8s-infra-shape.md §2).
 #
-# One image carries the goobers binary (daemon `up`, worker-style stage
-# invocation via args) plus the tier-3 operator binary, so the reference
-# manifests under deploy/reference/ can run every control-plane component
+# One image carries the goobers binary (daemon `up`), the fenced Kubernetes
+# attempt worker, and the tier-3 operator binary, so the reference manifests
+# under deploy/reference/ can run every control-plane component
 # from a single build. Build from the repo root:
 #
 #   docker build -f packaging/docker/Dockerfile -t <registry>/goobers:<tag> .
@@ -33,14 +33,15 @@ RUN go build -trimpath \
             -X github.com/goobers/goobers/internal/version.Commit=${COMMIT} \
             -X github.com/goobers/goobers/internal/version.Date=${DATE}" \
         -o /out/goobers ./cmd/goobers \
-    && go build -trimpath -ldflags "-s -w" -o /out/goobers-operator ./cmd/operator
+    && go build -trimpath -ldflags "-s -w" -o /out/goobers-operator ./cmd/operator \
+    && go build -trimpath -ldflags "-s -w" -o /out/goober-attempt ./cmd/goober-attempt
 
 FROM ${RUNTIME_IMAGE}
 # git + CA bundle: the daemon manages real clones/worktrees and speaks HTTPS
 # to the git/backlog provider; tzdata resolves instance-local schedule
 # triggers.
 RUN apk add --no-cache git ca-certificates tzdata
-COPY --from=build /out/goobers /out/goobers-operator /usr/local/bin/
+COPY --from=build /out/goobers /out/goobers-operator /out/goober-attempt /usr/local/bin/
 # 65532 mirrors the conventional distroless "nonroot" uid/gid so pod
 # securityContexts (runAsNonRoot, runAsUser: 65532) hold across base images.
 RUN addgroup -g 65532 nonroot \

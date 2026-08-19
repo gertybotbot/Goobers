@@ -154,6 +154,23 @@ func StageDeclarable(s string) bool {
 	return Known(s) && s != string(ConfigRepoRead)
 }
 
+// MutatesExternalState reports whether a capability can change repository or
+// provider state. This is the fail-closed boundary used by split executors: an
+// agentic reasoner may receive read/model grants directly, but mutation grants
+// must be consumed by a trusted, fenced provider executor. Keep this list in
+// the canonical registry rather than duplicating it at credential call sites.
+func MutatesExternalState(s string) bool {
+	switch Capability(s) {
+	case RepoPush,
+		GitHubIssuesWrite, GitHubMilestonesWrite, GitHubIssuesApprove,
+		ProviderPRWrite, GitHubPRWrite, GitHubPRReview, GitHubBranchDelete, GitHubPRMerge,
+		ADOPRComment, ADOPRWrite, ADOPRStatus, ADOWorkItemsWrite:
+		return true
+	default:
+		return false
+	}
+}
+
 // Suggest returns the closest canonical capability for a likely typo.
 func Suggest(s string) (Capability, bool) {
 	if Known(s) {

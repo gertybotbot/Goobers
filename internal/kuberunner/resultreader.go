@@ -1,6 +1,8 @@
 package kuberunner
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,10 +61,10 @@ func (f *FSResultReader) ReadResult(attempt AttemptID) ([]byte, error) {
 	return data, nil
 }
 
-// PublishResult writes a receipt for an attempt. It exists so the result
-// publisher and the controller share one path derivation and one encoder; a
-// producer that computes either independently is how digest-addressed formats
-// quietly stop being digest-addressed.
+// PublishResult writes an immutable receipt for an attempt. Re-publishing the
+// identical deterministic outcome is idempotent; replacing it is refused. A
+// hard link installs fully-written bytes without the rename-overwrite window
+// that would let two workers race different outcomes into the same slot.
 func (f *FSResultReader) PublishResult(attempt AttemptID, envelope apiv1.ResultEnvelope) error {
 	path, err := f.ResultPath(attempt)
 	if err != nil {
@@ -75,13 +77,49 @@ func (f *FSResultReader) PublishResult(attempt AttemptID, envelope apiv1.ResultE
 	if err != nil {
 		return err
 	}
-	// Write-then-rename so a reader never observes a partial receipt.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := samePublishedResult(path, data); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".result-*.tmp")
+	if err != nil {
+		return fmt.Errorf("kuberunner: create result temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("kuberunner: chmod result temp file: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("kuberunner: write result: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("kuberunner: sync result: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("kuberunner: close result: %w", err)
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return samePublishedResult(path, data)
+		}
 		return fmt.Errorf("kuberunner: publish result: %w", err)
+	}
+	return nil
+}
+
+func samePublishedResult(path string, want []byte) error {
+	got, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, want) {
+		return ErrResultConflict
 	}
 	return nil
 }

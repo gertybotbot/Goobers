@@ -287,6 +287,31 @@ func TestReconcileRecreatesJobAfterCrashBetweenAppendAndCreate(t *testing.T) {
 	}
 }
 
+func TestCreateAttemptJobRefusesForeignDeterministicNameCollision(t *testing.T) {
+	h := newHarness(t)
+	attempt := h.attempt("build", 1)
+	foreign := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: JobName(attempt), Namespace: testNamespace},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers:    []corev1.Container{{Name: "attempt", Image: "foreign/image"}},
+		}}},
+	}
+	if err := h.client.Create(context.Background(), foreign); err != nil {
+		t.Fatalf("create colliding Job: %v", err)
+	}
+	if _, err := h.reconciler.createAttemptJob(context.Background(), h.run(), attempt, h.machine); err != nil {
+		t.Fatalf("conflict projection: %v", err)
+	}
+	if !hasCondition(h.run().Status.Conditions, apiv1.GooberRunConditionReady, metav1.ConditionFalse, "AttemptJobConflict") {
+		t.Fatalf("missing AttemptJobConflict condition: %+v", h.run().Status.Conditions)
+	}
+	jobs := h.jobs()
+	if len(jobs) != 1 || jobs[0].Spec.Template.Spec.Containers[0].Image != "foreign/image" {
+		t.Fatalf("controller overwrote foreign Job: %+v", jobs)
+	}
+}
+
 // --- results advance runs, Jobs do not ------------------------------------
 
 func TestValidResultCommitsStageThenRunFinished(t *testing.T) {
@@ -823,7 +848,7 @@ func TestDuplicateJobObservationIsIdempotent(t *testing.T) {
 	name := JobName(attempt)
 
 	// Simulate a duplicate create racing in from another replica.
-	_, err := h.reconciler.createAttemptJob(context.Background(), h.run(), attempt)
+	_, err := h.reconciler.createAttemptJob(context.Background(), h.run(), attempt, h.machine)
 	if err != nil {
 		t.Fatalf("duplicate create returned an error instead of treating AlreadyExists as success: %v", err)
 	}

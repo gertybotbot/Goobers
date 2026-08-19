@@ -1751,6 +1751,9 @@ func (p *GiteaProvider) send(ctx context.Context, method, endpoint string, body 
 		if err != nil {
 			return nil, err
 		}
+		if err := authorizeProviderMutation(ctx, ProviderGitea, method, endpoint, body); err != nil {
+			return nil, err
+		}
 		token, err := p.resolveToken(ctx)
 		if err != nil {
 			return nil, err

@@ -269,6 +269,29 @@ func TestFSResultReaderTreatsAnEmptyFileAsMissing(t *testing.T) {
 	}
 }
 
+func TestFSResultPublisherIsIdempotentButNeverOverwritesAnOutcome(t *testing.T) {
+	store := NewFSResultReader(t.TempDir())
+	attempt := AttemptID{RunUID: "uid-1", RunID: "run-1", State: "build", Attempt: 1, FenceEpoch: 3}
+	first := apiv1.ResultEnvelope{Status: apiv1.ResultSuccess, Summary: "done"}
+	if err := store.PublishResult(attempt, first); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	if err := store.PublishResult(attempt, first); err != nil {
+		t.Fatalf("idempotent republish: %v", err)
+	}
+	if err := store.PublishResult(attempt, apiv1.ResultEnvelope{Status: apiv1.ResultFailure}); !errors.Is(err, ErrResultConflict) {
+		t.Fatalf("conflicting publish error = %v, want ErrResultConflict", err)
+	}
+	raw, err := store.ReadResult(attempt)
+	if err != nil {
+		t.Fatalf("read immutable result: %v", err)
+	}
+	validated, err := ValidateResult(attempt, raw)
+	if err != nil || validated.Envelope.Summary != "done" {
+		t.Fatalf("immutable result = %+v, err=%v", validated.Envelope, err)
+	}
+}
+
 // The path must be recomputable from the attempt alone, since after a crash the
 // controller has nothing else to go on.
 func TestFSResultReaderPathIsDeterministic(t *testing.T) {

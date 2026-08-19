@@ -40,6 +40,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
 
@@ -79,6 +80,18 @@ type RunReconciler struct {
 	ClaimTTL time.Duration
 	// WorkerImage overrides the attempt container image.
 	WorkerImage string
+	// CredentialBindings maps a declared stage capability to one Kubernetes
+	// Secret key and process environment variable. The Job receives bindings
+	// only for capabilities in its pinned AttemptPlan; undeclared credentials
+	// are never materialized.
+	CredentialBindings map[string]CredentialSecretBinding
+	// GooberCapabilities supplies a referenced reviewer goober's declared grants.
+	// Agentic gates have no stage-level capability field, so (as in the local
+	// runner) their goober definition is the upper and effective bound.
+	GooberCapabilities map[string][]string
+	// ClaimNamespace is passed to workers so they assert the same centralized
+	// retained-claim authority as the controller.
+	ClaimNamespace string
 }
 
 // MachineResolver resolves the pinned compiled machine for a run.
@@ -242,7 +255,7 @@ func (r *RunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			fmt.Sprintf("automated gate %q is not evaluated by this slice", state))
 
 	case StateTask:
-		return r.dispatchAttempt(ctx, &run, head, state)
+		return r.dispatchAttempt(ctx, &run, head, state, machine)
 
 	default:
 		return r.claimRenewalResult(&run), r.projectNotReady(ctx, &run, "UnknownState",
@@ -302,7 +315,7 @@ func (r *RunReconciler) judgeOpenAttempt(ctx context.Context, run *apiv1.GooberR
 		// window between append and create is still open, or the Job was
 		// deleted. Recreating under the SAME deterministic name is safe and is
 		// exactly what makes the append-then-create ordering recoverable.
-		return r.createAttemptJob(ctx, run, attempt)
+		return r.createAttemptJob(ctx, run, attempt, machine)
 	case err != nil:
 		return ctrl.Result{}, fmt.Errorf("get attempt job: %w", err)
 	}
@@ -394,7 +407,7 @@ func (r *RunReconciler) handleFailedAttempt(ctx context.Context, run *apiv1.Goob
 }
 
 // dispatchAttempt opens a new attempt: append intent, then create the Job.
-func (r *RunReconciler) dispatchAttempt(ctx context.Context, run *apiv1.GooberRun, head JournalHead, state string) (ctrl.Result, error) {
+func (r *RunReconciler) dispatchAttempt(ctx context.Context, run *apiv1.GooberRun, head JournalHead, state string, machine StateMachine) (ctrl.Result, error) {
 	attempt := AttemptID{
 		RunUID:     string(run.UID),
 		RunID:      run.Spec.RunID,
@@ -404,34 +417,55 @@ func (r *RunReconciler) dispatchAttempt(ctx context.Context, run *apiv1.GooberRu
 		FenceEpoch: claimEpoch(head),
 	}
 
+	// Resolve and validate pinned source before opening the durable attempt. In
+	// particular, a mutation-capable agent is refused before stage.started so it
+	// cannot receive a raw write credential and leave an unexecutable open slot.
+	if _, err := r.attemptPlan(run, attempt, machine); err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "AttemptSourceInvalid", err.Error())
+	}
+
 	// Intent is journalled BEFORE the Job exists. If the process dies here, the
 	// next reconcile sees an open attempt with no Job and recreates it under
 	// the same deterministic name.
 	if _, err := r.Journal.AppendStageStarted(run.Spec.RunID, attempt); err != nil {
 		return ctrl.Result{}, fmt.Errorf("commit stage.started: %w", err)
 	}
-	return r.createAttemptJob(ctx, run, attempt)
+	return r.createAttemptJob(ctx, run, attempt, machine)
 }
 
 // createAttemptJob creates the deterministically-named Job, treating an
 // existing one as success.
-func (r *RunReconciler) createAttemptJob(ctx context.Context, run *apiv1.GooberRun, attempt AttemptID) (ctrl.Result, error) {
+func (r *RunReconciler) createAttemptJob(ctx context.Context, run *apiv1.GooberRun, attempt AttemptID, machine StateMachine) (ctrl.Result, error) {
 	if err := r.assertAttemptFence(ctx, run, attempt); err != nil {
 		return ctrl.Result{}, r.projectNotReady(ctx, run, "ClaimFenceLost",
 			fmt.Sprintf("refusing to dispatch %s without the current business fence: %v", attempt.String(), err))
 	}
-	job := r.desiredJob(run, attempt)
+	plan, err := r.attemptPlan(run, attempt, machine)
+	if err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "AttemptSourceInvalid", err.Error())
+	}
+	job, err := r.desiredJob(run, attempt, plan)
+	if err != nil {
+		return ctrl.Result{}, r.projectNotReady(ctx, run, "AttemptSourceInvalid", err.Error())
+	}
 	if err := controllerutil.SetControllerReference(run, job, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("set owner reference: %w", err)
 	}
 
-	err := r.Create(ctx, job)
+	err = r.Create(ctx, job)
 	switch {
 	case err == nil:
 	case apierrors.IsAlreadyExists(err):
-		// Create-once. A duplicate observation, a retried reconcile, or a
-		// second replica racing all land here, and all of them are correct
-		// outcomes: the attempt has exactly one Job.
+		// Create-once, but never blind adoption. Attempt Jobs now carry scoped
+		// credentials, so a foreign or differently sourced object under the
+		// deterministic name must not be mistaken for this occurrence.
+		var existing batchv1.Job
+		if getErr := r.Get(ctx, client.ObjectKey{Namespace: job.Namespace, Name: job.Name}, &existing); getErr != nil {
+			return ctrl.Result{}, fmt.Errorf("get existing attempt job: %w", getErr)
+		}
+		if validateErr := validateExistingAttemptJob(run, job, &existing); validateErr != nil {
+			return ctrl.Result{}, r.projectNotReady(ctx, run, "AttemptJobConflict", validateErr.Error())
+		}
 	default:
 		return ctrl.Result{}, fmt.Errorf("create attempt job: %w", err)
 	}
@@ -444,10 +478,61 @@ func (r *RunReconciler) createAttemptJob(ctx context.Context, run *apiv1.GooberR
 }
 
 // desiredJob builds the attempt Job.
-func (r *RunReconciler) desiredJob(run *apiv1.GooberRun, attempt AttemptID) *batchv1.Job {
+func (r *RunReconciler) desiredJob(run *apiv1.GooberRun, attempt AttemptID, plan *AttemptPlan) (*batchv1.Job, error) {
 	labels := AttemptLabels(run.Spec.Gaggle, attempt)
+	env := []corev1.EnvVar{
+		{Name: "GOOBERS_RUN_ID", Value: attempt.RunID},
+		{Name: "GOOBERS_RUN_UID", Value: attempt.RunUID},
+		{Name: "GOOBERS_STATE", Value: attempt.State},
+		{Name: "GOOBERS_ATTEMPT", Value: fmt.Sprintf("%d", attempt.Attempt)},
+		{Name: "GOOBERS_BRANCH", Value: fmt.Sprintf("%d", attempt.Branch)},
+		{Name: "GOOBERS_FENCE_EPOCH", Value: fmt.Sprintf("%d", attempt.FenceEpoch)},
+		{Name: "GOOBERS_RESULT_PATH", Value: ResultMountPath + "/" + ResultFileName},
+		{Name: "GOOBERS_RESULTS_ROOT", Value: ResultMountPath},
+		{Name: "GOOBERS_JOURNAL_ROOT", Value: run.Spec.JournalRoot},
+	}
+	command := []string(nil)
+	if plan != nil {
+		encoded, err := EncodeAttemptPlan(*plan)
+		if err != nil {
+			return nil, err
+		}
+		env = append(env, corev1.EnvVar{Name: AttemptPlanEnv, Value: encoded})
+		credentialEnv := map[string]string{}
+		capabilities := append([]string(nil), plan.Invocation.Capabilities...)
+		sort.Strings(capabilities)
+		for _, grant := range capabilities {
+			binding, ok := r.CredentialBindings[grant]
+			if !ok {
+				continue
+			}
+			if err := binding.validate(grant); err != nil {
+				return nil, err
+			}
+			if previous, exists := credentialEnv[binding.Env]; exists && previous != grant {
+				return nil, fmt.Errorf("kuberunner: capabilities %q and %q collide on credential environment %q", previous, grant, binding.Env)
+			}
+			credentialEnv[binding.Env] = grant
+			env = append(env, corev1.EnvVar{Name: binding.Env, ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: binding.SecretName}, Key: binding.SecretKey},
+			}})
+		}
+		command = []string{AttemptWorkerEntry}
+	}
+	if key, ok := businessClaimKey(run); ok {
+		claimNamespace := r.ClaimNamespace
+		if claimNamespace == "" {
+			claimNamespace = DefaultClaimNamespace
+		}
+		env = append(env,
+			corev1.EnvVar{Name: "GOOBERS_CLAIM_NAMESPACE", Value: claimNamespace},
+			corev1.EnvVar{Name: "GOOBERS_CLAIM_GAGGLE", Value: key.Gaggle},
+			corev1.EnvVar{Name: "GOOBERS_CLAIM_PROVIDER", Value: key.Provider},
+			corev1.EnvVar{Name: "GOOBERS_CLAIM_EXTERNAL_ID", Value: key.ExternalID},
+		)
+	}
 
-	return &batchv1.Job{
+	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      JobName(attempt),
 			Namespace: run.Namespace,
@@ -471,18 +556,10 @@ func (r *RunReconciler) desiredJob(run *apiv1.GooberRun, attempt AttemptID) *bat
 					RestartPolicy:      corev1.RestartPolicyNever,
 					ServiceAccountName: run.Spec.ServiceAccountName,
 					Containers: []corev1.Container{{
-						Name:  "attempt",
-						Image: r.workerImage(run),
-						Env: []corev1.EnvVar{
-							{Name: "GOOBERS_RUN_ID", Value: attempt.RunID},
-							{Name: "GOOBERS_RUN_UID", Value: attempt.RunUID},
-							{Name: "GOOBERS_STATE", Value: attempt.State},
-							{Name: "GOOBERS_ATTEMPT", Value: fmt.Sprintf("%d", attempt.Attempt)},
-							{Name: "GOOBERS_BRANCH", Value: fmt.Sprintf("%d", attempt.Branch)},
-							{Name: "GOOBERS_FENCE_EPOCH", Value: fmt.Sprintf("%d", attempt.FenceEpoch)},
-							{Name: "GOOBERS_RESULT_PATH", Value: ResultMountPath + "/" + ResultFileName},
-							{Name: "GOOBERS_JOURNAL_ROOT", Value: run.Spec.JournalRoot},
-						},
+						Name:    "attempt",
+						Image:   r.workerImage(run),
+						Command: command,
+						Env:     env,
 						VolumeMounts: []corev1.VolumeMount{{
 							Name:      "result",
 							MountPath: ResultMountPath,
@@ -498,6 +575,28 @@ func (r *RunReconciler) desiredJob(run *apiv1.GooberRun, attempt AttemptID) *bat
 			},
 		},
 	}
+	return job, nil
+}
+
+func validateExistingAttemptJob(run *apiv1.GooberRun, want, got *batchv1.Job) error {
+	owner := metav1.GetControllerOf(got)
+	if owner == nil || owner.Kind != "GooberRun" || owner.Name != run.Name || owner.UID != run.UID {
+		return fmt.Errorf("kuberunner: existing Job %q is not controlled by run UID %q", got.Name, run.UID)
+	}
+	for key, value := range want.Labels {
+		if got.Labels[key] != value {
+			return fmt.Errorf("kuberunner: existing Job %q has mismatched label %q", got.Name, key)
+		}
+	}
+	wantPod, gotPod := want.Spec.Template.Spec, got.Spec.Template.Spec
+	if len(wantPod.Containers) != 1 || len(gotPod.Containers) != 1 ||
+		!reflect.DeepEqual(wantPod.Containers[0], gotPod.Containers[0]) ||
+		wantPod.ServiceAccountName != gotPod.ServiceAccountName ||
+		wantPod.RestartPolicy != gotPod.RestartPolicy ||
+		!reflect.DeepEqual(want.Spec.BackoffLimit, got.Spec.BackoffLimit) {
+		return fmt.Errorf("kuberunner: existing Job %q does not match the pinned attempt source", got.Name)
+	}
+	return nil
 }
 
 func (r *RunReconciler) workerImage(run *apiv1.GooberRun) string {

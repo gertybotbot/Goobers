@@ -487,6 +487,9 @@ func (p *ADOProvider) send(ctx context.Context, method, endpoint string, body in
 		if err != nil {
 			return nil, err
 		}
+		if err := authorizeProviderMutation(ctx, ProviderADO, method, endpoint, body); err != nil {
+			return nil, err
+		}
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}

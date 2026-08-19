@@ -2951,6 +2951,9 @@ func (p *GitHubProvider) sendWithAcceptRetryable(ctx context.Context, method, en
 		if err != nil {
 			return nil, err
 		}
+		if err := authorizeProviderMutation(ctx, ProviderGitHub, method, endpoint, body); err != nil {
+			return nil, err
+		}
 		token, err := p.resolveToken(ctx)
 		if err != nil {
 			return nil, err

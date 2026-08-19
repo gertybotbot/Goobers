@@ -43,6 +43,19 @@ func NewCompiledMachine(m *workflow.Machine, pinnedDigest string) (*CompiledMach
 func (c *CompiledMachine) Start() string { return c.start }
 
 // Kind classifies a state.
+// ExecutableState returns the source definition for one executable state. The
+// controller uses this only to build immutable worker input after it has made
+// and journalled the dispatch decision through StateMachine.
+func (c *CompiledMachine) ExecutableState(state string) (apiv1.Task, *apiv1.Gate, bool) {
+	if task, ok := c.machine.Task(state); ok {
+		return task, nil, true
+	}
+	if gate, ok := c.machine.Gate(state); ok && gate.Evaluator == apiv1.EvaluatorAgentic {
+		return apiv1.Task{}, &gate, true
+	}
+	return apiv1.Task{}, nil, false
+}
+
 func (c *CompiledMachine) Kind(state string) StateKind {
 	// The successful terminal is spelled "" in the DSL and "@complete" in the
 	// journal (journal.TargetComplete is the explicit representation of the

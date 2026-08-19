@@ -40,6 +40,12 @@ type Options struct {
 	// ClaimNamespace is the single namespace containing retained business-claim
 	// records. It must be shared by every watched GooberRun namespace.
 	ClaimNamespace string
+	// CredentialBindings maps stage capability grants to scoped Secret keys for
+	// source-backed attempt Jobs. Only a plan's declared grants are projected.
+	CredentialBindings map[string]kuberunner.CredentialSecretBinding
+	// GooberCapabilities supplies agentic reviewer gates with the referenced
+	// goober definition's declared grants.
+	GooberCapabilities map[string][]string
 }
 
 // DefaultOptions returns sane defaults for running in-cluster.
@@ -123,13 +129,16 @@ func setupKubeRunner(mgr manager.Manager, logger *slog.Logger, opts Options) err
 	}
 
 	runReconciler := &kuberunner.RunReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Journal:     store,
-		Results:     kuberunner.NewFSResultReader(resultsDir),
-		Machine:     kuberunner.StaticMachineResolver{},
-		Claims:      &kuberunner.KubeClaimStore{Client: mgr.GetClient(), Namespace: claimNamespace},
-		WorkerImage: opts.WorkerImage,
+		Client:             mgr.GetClient(),
+		Scheme:             mgr.GetScheme(),
+		Journal:            store,
+		Results:            kuberunner.NewFSResultReader(resultsDir),
+		Machine:            kuberunner.StaticMachineResolver{},
+		Claims:             &kuberunner.KubeClaimStore{Client: mgr.GetClient(), Namespace: claimNamespace},
+		ClaimNamespace:     claimNamespace,
+		CredentialBindings: opts.CredentialBindings,
+		GooberCapabilities: opts.GooberCapabilities,
+		WorkerImage:        opts.WorkerImage,
 	}
 	if err := runReconciler.SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("setup gooberrun reconciler: %w", err)
